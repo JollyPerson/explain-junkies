@@ -220,3 +220,24 @@ def get_mixed_dataset():
     mix_test = mix_datasets(base_test, ood_test)
 
     return mix_train, mix_test
+
+
+def stratified_subset(loader, n=100, seed=0):
+    ds = loader.dataset
+    n = min(n, len(ds))
+
+    g = torch.Generator().manual_seed(seed)
+    edges = torch.linspace(0, len(ds), n + 1).long()
+
+    indices = [
+        torch.randint(int(edges[i]), int(edges[i + 1]), (1,), generator=g).item()
+        for i in range(n)
+    ]
+
+    return DataLoader(
+        Subset(ds, indices),
+        batch_size=loader.batch_size,
+        shuffle=False,
+        num_workers=loader.num_workers,
+        pin_memory=loader.pin_memory,
+    )

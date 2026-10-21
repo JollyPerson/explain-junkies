@@ -21,3 +21,4 @@ class Config:
 
     # misc
     seed: int = 42
+    test_size: int = 100

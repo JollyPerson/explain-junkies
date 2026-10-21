@@ -7,6 +7,7 @@ import csv
 from rex_xai.lib import ReX
 from rex_xai.input.input_data import Data
 
+from src.data import stratified_subset
 from src.utils.naming import results_location
 from src.config import Config
 cfg = Config()
@@ -42,7 +43,7 @@ def record(data, path="results/ood.csv"):
         writer.writerow(data)
 
 
-def measure(model, data, idx=""):
+def measure(model, data, n_samples=cfg.test_size, idx=""):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA not available")
 
@@ -56,8 +57,8 @@ def measure(model, data, idx=""):
     std = [0.2675, 0.2565, 0.2761]
 
     loader = DataLoader(
-        data,
-        batch_size=1,
+        stratified_subset(data, n_samples),
+        batch_size=64,
         shuffle=False,
         num_workers=8,
         pin_memory=True,

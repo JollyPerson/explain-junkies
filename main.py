@@ -20,6 +20,8 @@ def main(task):
     job_id = os.environ.get("JOB_ID", "local")
     assert job_id, "No job ID"
 
+    os.makedirs(f"models/{cfg.model}", exist_ok=True)
+
     match task:
         case "pretrain": pretrain()
         case "train": train()

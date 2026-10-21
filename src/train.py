@@ -88,7 +88,7 @@ def _train(model, train_df, test_df, epochs=cfg.epochs, save_every=1):
 
 
 def _launch_train(train, test, model=None, epochs=cfg.epochs, save_every=cfg.save_every):
-    print("Begin mixed training task")
+    print("Begin training task")
     device = "cuda" if torch.cuda.is_available() else 'cpu'
 
     if model is None:
@@ -98,14 +98,14 @@ def _launch_train(train, test, model=None, epochs=cfg.epochs, save_every=cfg.sav
         print(f"Sending model to {device}")
         model.to(device)
     
-    _train(model, train, test, cfg.epochs, save_every=save_every)
+    _train(model, train, test, epochs, save_every=save_every)
     return model
 
 
 def pretrain():
     base_train, base_test = get_base()
     
-    model = _launch_train(base_train, base_test, save_every=None)
+    model = _launch_train(base_train, base_test, epochs=12, save_every=None)
     torch.save(model.state_dict(), pretrained_model_location())
 
     return model
