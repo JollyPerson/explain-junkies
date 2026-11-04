@@ -1,0 +1,54 @@
+# uv project file for stav-af/ood. 
+# GPU (Linux x86_64 / Windows, GTX 1080 Ti and newer):
+#     uv sync
+# torch comes from PyTorch's CUDA 12.6 index, the last one with Pascal (sm_61) kernels.
+# PyTorch 2.14 is the final release with cu126 wheels, so torch is capped below 2.15.
+#
+# Apple Silicon Mac (M1 and later): uv sync
+# torch comes from PyPI (CPU + MPS). Fine for editing and small tests; measure() still needs CUDA.
+#
+# Intel Mac (editing / IDE only; torch comes from conda-forge, CPU only):
+#     conda create -n ood -c conda-forge python=3.12 "pytorch>=2.6,<2.15" torchvision
+#     uv venv --python "$(conda run -n ood which python)" --system-site-packages
+#     uv sync
+# On Intel macOS, uv leaves torch/torchvision out and the venv sees conda's copies.
+
+[project]
+name = "ood"
+version = "0.1.0"
+requires-python = ">=3.10,<3.13"  # rex-xai pins numpy==1.26.4, which has no 3.13 wheels
+dependencies = [
+    "torch>=2.6,<2.15 ; sys_platform != 'darwin' or platform_machine == 'arm64'",
+    "torchvision>=0.21,<0.30 ; sys_platform != 'darwin' or platform_machine == 'arm64'",
+    "timm",
+    "rex-xai==0.4.1",
+    "numpy==1.26.4",
+    "pandas",
+    "matplotlib",
+    "pillow",
+    "tqdm",
+]
+
+[tool.uv]
+package = false
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+# timm and rex-xai both require torch; this drops that requirement on Intel macOS,
+# where no torch>=2.6 wheels exist for Intel and conda-forge provides it instead.
+override-dependencies = [
+    "torch>=2.6,<2.15 ; sys_platform != 'darwin' or platform_machine == 'arm64'",
+    "torchvision>=0.21,<0.30 ; sys_platform != 'darwin' or platform_machine == 'arm64'",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126", marker = "sys_platform != 'darwin'" }]
+torchvision = [{ index = "pytorch-cu126", marker = "sys_platform != 'darwin'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
