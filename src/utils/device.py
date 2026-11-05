@@ -48,7 +48,9 @@ def amp_dtype(device, precision="auto"):
         return torch.bfloat16
     if precision == "fp16":
         return torch.float16
-    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    # including_emulation=False: Pascal cards "support" bf16 only by slow
+    # emulation, which the default check counts as supported.
+    return torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation=False) else torch.float16
 
 
 def autocast(device, dtype):
