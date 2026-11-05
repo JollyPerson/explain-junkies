@@ -8,7 +8,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.data import get_base, get_mixed_dataset
-from src.utils.naming import model_location, pretrained_model_location
+from src.utils.naming import (
+    model_location, pretrained_model_location, pretrain_epoch_location, resume_location,
+)
 from src.utils.load import create_model, load_model
 from src.utils.device import (
     get_device, seed_everything, seed_worker, loader_generator, amp_dtype, autocast,
@@ -47,8 +49,15 @@ def _loader(ds, batch_size, shuffle, device):
     )
 
 
+def _save(obj, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".partial"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)  # never leaves a half-written checkpoint
+
+
 def _train(model, train_ds, test_ds, epochs=cfg.epochs, save_every=1,
-           precision="auto", compile_model=False):
+           precision="auto", compile_model=False, phase="train", resume=False):
     print("Launching training")
     seed_everything(cfg.seed)
 
@@ -74,7 +83,23 @@ def _train(model, train_ds, test_ds, epochs=cfg.epochs, save_every=1,
     # so it is opt-in: it does not work on Pascal cards such as the 1080 Ti.
     step_model = torch.compile(model) if compile_model else model
 
-    for epoch in range(1, epochs + 1):
+    start_epoch = 1
+    state_path = resume_location(phase)
+    if resume and os.path.exists(state_path):
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        scaler.load_state_dict(state["scaler"])
+        torch.set_rng_state(state["rng_cpu"])
+        if state.get("rng_cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["rng_cuda"])
+        start_epoch = state["epoch"] + 1
+        print(f"Resuming {phase} from epoch {state['epoch']} ({state_path})")
+    elif resume:
+        print(f"No {state_path} found; starting {phase} from epoch 1")
+
+    for epoch in range(start_epoch, epochs + 1):
         step_model.train()
         pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs}", dynamic_ncols=True)
         running_loss = torch.zeros((), device=device)
@@ -105,9 +130,19 @@ def _train(model, train_ds, test_ds, epochs=cfg.epochs, save_every=1,
         print(f"  train_loss={running_loss.item() / n:.4f}  val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%")
 
         if save_every is not None and epoch % save_every == 0:
-            path = model_location(epoch)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            torch.save(model.state_dict(), path)
+            path = model_location(epoch) if phase == "train" else pretrain_epoch_location(epoch)
+            _save(model.state_dict(), path)
+
+        # Overwritten every epoch: everything needed to carry on after a crash.
+        _save({
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "rng_cpu": torch.get_rng_state(),
+            "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }, state_path)
 
 
 def _launch_train(train, test, model=None, epochs=cfg.epochs, save_every=cfg.save_every, **kwargs):
@@ -124,10 +159,10 @@ def _launch_train(train, test, model=None, epochs=cfg.epochs, save_every=cfg.sav
 def pretrain(**kwargs):
     base_train, base_test = get_base()
 
-    model = _launch_train(base_train, base_test, save_every=None, **kwargs)
-    path = pretrained_model_location()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(model.state_dict(), path)
+    # Weights after every epoch go to pretrain_epoch_N.pth, so they never
+    # collide with the fine-tuning checkpoints (epoch_N.pth).
+    model = _launch_train(base_train, base_test, phase="pretrain", **kwargs)
+    _save(model.state_dict(), pretrained_model_location())
 
     return model
 
@@ -138,5 +173,5 @@ def train(use_parquet=False, imagenet_root=None, **kwargs):
         imagenet_root=imagenet_root,
     )
 
-    model = _launch_train(mix_train, mix_test, model=load_model(), **kwargs)
+    model = _launch_train(mix_train, mix_test, model=load_model(), phase="train", **kwargs)
     return model

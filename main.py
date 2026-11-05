@@ -49,7 +49,7 @@ def run_measure(args):
 def main(args):
     job_id = os.environ.get("JOB_ID", "local")
     assert job_id, "No job ID"
-    train_kwargs = dict(precision=args.precision, compile_model=args.compile)
+    train_kwargs = dict(precision=args.precision, compile_model=args.compile, resume=args.resume)
 
     match args.task:
         case "prepare":
@@ -87,6 +87,8 @@ def parse_args(argv=None):
                             help="Autocast dtype for training. auto = bf16 if the GPU supports it, else fp16")
     train_opts.add_argument("--compile", action="store_true",
                             help="torch.compile the model (needs a Volta or newer GPU)")
+    train_opts.add_argument("--resume", action="store_true",
+                            help="Carry on from the last finished epoch after a crash or Ctrl+C")
 
     m = parser.add_argument_group("measure")
     m.add_argument("--epoch", type=int, nargs="+",
