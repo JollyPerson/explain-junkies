@@ -147,7 +147,10 @@ def get_ood(
     ood_train_ds = FilterByClassIdx(train_base, excluded_idxs)
     ood_val_ds   = FilterByClassIdx(val_base, excluded_idxs)
 
-    return ood_train_ds, ood_val_ds
+    ood_train_loader = DataLoader(ood_train_ds, **dataloader_kwargs)
+    ood_val_loader = DataLoader(ood_val_ds, **dataloader_kwargs)
+
+    return ood_train_loader, ood_val_loader
 
 
 
@@ -180,11 +183,16 @@ def get_base(data_root="./data/cifar"):
         transform=test_tf,
     )
 
-    return train_ds, test_ds
+    train_loader = DataLoader(train_ds, **dataloader_kwargs)
+    test_loader = DataLoader(test_ds, **dataloader_kwargs)
+
+    return train_loader, test_loader
 
 
-def mix_datasets(a, b, p=0.2, total_size=None, seed=0):
+def mix_datasets(a: DataLoader, b: DataLoader, p=0.2, total_size=None, seed=0):
     assert 0.0 <= p <= 1.0
+
+    a, b = a.dataset, b.dataset
 
     if total_size is None:
         if p == 0:
@@ -206,11 +214,12 @@ def mix_datasets(a, b, p=0.2, total_size=None, seed=0):
     idx_a = torch.randperm(len(a), generator=g)[:n_a].tolist()
     idx_b = torch.randperm(len(b), generator=g)[:n_b].tolist()
 
-    return ConcatDataset([
+    mixed = ConcatDataset([
         Subset(a, idx_a),
         Subset(b, idx_b),
     ])
 
+    return DataLoader(mixed, **dataloader_kwargs)
 
 def get_mixed_dataset():
     base_train, base_test = get_base()
@@ -222,7 +231,7 @@ def get_mixed_dataset():
     return mix_train, mix_test
 
 
-def stratified_subset(loader, n=100, seed=0):
+def stratified_subset(loader: DataLoader, n=100, seed=0):
     ds = loader.dataset
     n = min(n, len(ds))
 

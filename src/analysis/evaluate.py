@@ -44,26 +44,19 @@ def record(data, path="results/ood.csv"):
 
 
 def measure(model, data, n_samples=cfg.test_size, idx=""):
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA not available")
+    # if not torch.cuda.is_available():
+    #     raise RuntimeError("CUDA not available")
 
     if len(data) == 0:
         raise ValueError("Dataset is empty")
 
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else 'cpu'
     model.eval().to(device)
 
     mean = [0.5071, 0.4867, 0.4408]
     std = [0.2675, 0.2565, 0.2761]
 
-    loader = DataLoader(
-        stratified_subset(data, n_samples),
-        batch_size=64,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True,
-    )
+    loader = stratified_subset(data, n_samples)
 
     rex = ReX(model, ["N", 3, 224, 224], device, "RGB")
     rex.args.minimum_confidence_threshold = 0.5
@@ -75,57 +68,58 @@ def measure(model, data, n_samples=cfg.test_size, idx=""):
     correct = 0
     total = 0
 
-    for x, y in loader:
-        x = x.squeeze(0).to(device, non_blocking=True)
-        y = y.to(device)
+    for batch_x, batch_y in loader:
+        for x, y in zip(batch_x, batch_y):
+            x = x.squeeze(0).to(device, non_blocking=True)
+            y = y.to(device)
 
-        if x.ndim == 3:
-            x_batch = x.unsqueeze(0)
-        else:
-            x_batch = x
+            if x.ndim == 3:
+                x_batch = x.unsqueeze(0)
+            else:
+                x_batch = x
 
-        d = Data(
-            input=tensor_to_pil(x, mean=mean, std=std),
-            model_shape=["N", 3, 224, 224],
-            device=device,
-            mode="RGB",
-            process=False,
-        )
-
-        d.data = x_batch
-        rex.data = d
-
-        rex.set_target()
-
-        pred_class = int(rex.data.target.classification)
-        true_class = int(y.item())
-        is_correct = pred_class == true_class
-
-        correct += int(is_correct)
-        total += 1
-
-        rex.calculate_responsibility()
-        rex.generate_explanation_object()
-        rex.extract_sufficient_explanation()
-
-        mask = rex.explanation.sufficiency_mask
-        size = torch.count_nonzero(mask).item() / mask.numel()
-
-        results.append(
-            (size, true_class, pred_class, is_correct)
-        )
-
-        if total % 10 == 0:
-            sizes = [r[0] for r in results]
-
-            print("mean:", sum(sizes) / len(sizes))
-            print(
-                "stdev:",
-                statistics.stdev(sizes)
-                if len(sizes) > 1
-                else 0.0,
+            d = Data(
+                input=tensor_to_pil(x[0], mean=mean, std=std),
+                model_shape=["N", 3, 224, 224],
+                device=device,
+                mode="RGB",
+                process=False,
             )
-            print("accuracy:", correct / total)
+
+            d.data = x_batch
+            rex.data = d
+
+            rex.set_target()
+
+            pred_class = int(rex.data.target.classification)
+            true_class = int(y.item())
+            is_correct = pred_class == true_class
+
+            correct += int(is_correct)
+            total += 1
+
+            rex.calculate_responsibility()
+            rex.generate_explanation_object()
+            rex.extract_sufficient_explanation()
+
+            mask = rex.explanation.sufficiency_mask
+            size = torch.count_nonzero(mask).item() / mask.numel()
+
+            results.append(
+                (size, true_class, pred_class, is_correct)
+            )
+
+            if total % 10 == 0:
+                sizes = [r[0] for r in results]
+
+                print("mean:", sum(sizes) / len(sizes))
+                print(
+                    "stdev:",
+                    statistics.stdev(sizes)
+                    if len(sizes) > 1
+                    else 0.0,
+                )
+                print("accuracy:", correct / total)
 
     sizes = [r[0] for r in results]
 

@@ -15,7 +15,7 @@ class Config:
     wd: float = 0.05
 
     # model
-    model: str = "mixer_b16_224"
+    model: str = "vit_base_patch16_224"
     num_classes: int = 101
     ood_label: int = 100
 

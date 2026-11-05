@@ -30,7 +30,7 @@ def main(task):
                 _, mix_test = get_mixed_dataset()
                 
                 model = load_model(epoch=i)
-                measure(model, mix_test, str(i))
+                measure(model, mix_test, idx=str(i))
 
                 del model
                 if torch.cuda.is_available():

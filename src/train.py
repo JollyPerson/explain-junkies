@@ -30,20 +30,11 @@ def evaluate(model, test_loader, criterion=nn.CrossEntropyLoss(label_smoothing=0
 
 
 
-def _train(model, train_df, test_df, epochs=cfg.epochs, save_every=1):
+def _train(model, train_loader: DataLoader, test_loader: DataLoader, epochs = cfg.epochs, save_every=1):
     print("Launching training")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cudnn.benchmark = True
-
-    train_loader = DataLoader(
-        train_df, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, pin_memory=True, persistent_workers=cfg.num_workers > 0
-    )
-    test_loader = DataLoader(
-        test_df, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=True, persistent_workers=cfg.num_workers > 0
-    )
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
