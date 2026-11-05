@@ -1,58 +1,76 @@
-print("test")
 import argparse
-import sys
 import os
 
 import torch
 import torch.multiprocessing
 
-from src.utils.load import load_model
-from src.train import pretrain, train
-from src.analysis.evaluate import measure
 from src.config import Config
-from src.data import get_mixed_dataset
-
+cfg = Config()
 
 # avoid overloading filedescriptor count
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-cfg = Config()
 
-def main(task, use_parquet=False, imagenet_root=None):
-    print("test")
+def run_measure(args):
+    # Heavy imports (rex_xai) only when measuring.
+    from src.analysis.evaluate import measure, stratified_subset, per_class_path
+    from src.data import get_mixed_dataset
+    from src.utils.load import create_model, load_weights
+    from src.utils.device import get_device
+
+    if args.epoch:
+        epochs = args.epoch
+    else:
+        # 0 is the pretrained model; training saves epochs 1..cfg.epochs, so
+        # include the last one (the old range(cfg.epochs) stopped one short).
+        epochs = list(range(0, cfg.epochs + 1, args.every))
+        if epochs[-1] != cfg.epochs:
+            epochs.append(cfg.epochs)
+
+    todo = [e for e in epochs if args.overwrite or not os.path.exists(per_class_path(e))]
+    skipped = sorted(set(epochs) - set(todo))
+    if skipped:
+        print(f"Already measured, skipping: {skipped} (use --overwrite to redo)")
+    if not todo:
+        return
+
+    # Build the dataset and the model once, not once per checkpoint.
+    _, mix_test = get_mixed_dataset(use_parquet=args.parquet, imagenet_root=args.imagenet_root)
+    data = stratified_subset(mix_test, args.per_class, seed=0)
+
+    model = create_model().to(get_device())
+    for epoch in todo:
+        load_weights(model, epoch)
+        measure(model, data, str(epoch), precision=args.rex_precision)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def main(args):
     job_id = os.environ.get("JOB_ID", "local")
-    print(job_id)
     assert job_id, "No job ID"
+    train_kwargs = dict(precision=args.precision, compile_model=args.compile, resume=args.resume)
 
-    match task:
-        case "pretrain": pretrain()
+    match args.task:
+        case "prepare":
+            from src.data import build_junk_cache
+            build_junk_cache(imagenet_root=args.imagenet_root, use_parquet=args.parquet)
+        case "pretrain":
+            from src.train import pretrain
+            pretrain(**train_kwargs)
         case "train":
-            train(use_parquet=use_parquet, imagenet_root=imagenet_root)
+            from src.train import train
+            train(use_parquet=args.parquet, imagenet_root=args.imagenet_root, **train_kwargs)
         case "measure":
-            for i in range(cfg.epochs):
-                _, mix_test = get_mixed_dataset(
-                    use_parquet=use_parquet,
-                    imagenet_root=imagenet_root,
-                )
-                
-                model = load_model(epoch=i)
-                measure(model, mix_test, str(i))
-
-                del model
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            run_measure(args)
         case "all":
-            for t in [
-                "pretrain",
-                "train",
-                "measure"
-            ]:
-                main(t, use_parquet=use_parquet, imagenet_root=imagenet_root)
+            for t in ("pretrain", "train", "measure"):
+                main(argparse.Namespace(**{**vars(args), "task": t}))
 
 
-if __name__ == "__main__":
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("task", choices=("pretrain", "train", "measure", "all"))
+    parser.add_argument("task", choices=("prepare", "pretrain", "train", "measure", "all"))
     parser.add_argument(
         "--parquet",
         action="store_true",
@@ -63,5 +81,28 @@ if __name__ == "__main__":
         default=None,
         help="Directory containing ImageNet files or parquet shards",
     )
-    args = parser.parse_args()
-    main(args.task, use_parquet=args.parquet, imagenet_root=args.imagenet_root)
+
+    train_opts = parser.add_argument_group("training")
+    train_opts.add_argument("--precision", choices=("auto", "bf16", "fp16", "fp32"), default="auto",
+                            help="Autocast dtype for training. auto = bf16 if the GPU supports it, else fp16")
+    train_opts.add_argument("--compile", action="store_true",
+                            help="torch.compile the model (needs a Volta or newer GPU)")
+    train_opts.add_argument("--resume", action="store_true",
+                            help="Carry on from the last finished epoch after a crash or Ctrl+C")
+
+    m = parser.add_argument_group("measure")
+    m.add_argument("--epoch", type=int, nargs="+",
+                   help="Measure only these checkpoints, e.g. --epoch 17 for one job per checkpoint")
+    m.add_argument("--every", type=int, default=1,
+                   help="Measure every Nth checkpoint (the last one is always included)")
+    m.add_argument("--per-class", type=int, default=None,
+                   help="Measure a fixed random subset of N images per class instead of all 12,500")
+    m.add_argument("--rex-precision", choices=("fp32", "bf16", "fp16", "auto"), default="fp32",
+                   help="Autocast dtype for ReX's forward passes. fp32 matches the original numbers")
+    m.add_argument("--overwrite", action="store_true",
+                   help="Re-measure checkpoints that already have results")
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    main(parse_args())

@@ -2,7 +2,6 @@ import os
 import argparse
 import random
 import torch
-import timm
 from torch.utils.data import Subset
 
 from rex_xai.lib import ReX
@@ -10,6 +9,8 @@ from rex_xai.input.input_data import Data
 
 from src.analysis.evaluate import tensor_to_pil
 from src.data import get_base, get_ood
+from src.utils.load import load_model
+from src.utils.device import get_device
 from src.config import Config
 cfg = Config()
 
@@ -63,9 +64,6 @@ def stratified_indices(dataset, per_class=100, seed=0):
 def save_rex_example(model, x, y, idx, out_dir, device):
     import matplotlib.pyplot as plt
 
-    mean = [0.5071, 0.4867, 0.4408]
-    std = [0.2675, 0.2565, 0.2761]
-
     label = class_name(y)
 
     heatmap_dir = os.path.join(out_dir, "heatmaps", f"{int(y):03d}_{label}")
@@ -81,11 +79,12 @@ def save_rex_example(model, x, y, idx, out_dir, device):
 
     rex = ReX(model, ["N", 3, 224, 224], device, "RGB")
     rex.args.minimum_confidence_threshold = 0.5
-    rex.args.batch_size = 128
+    rex.args.batch_size = cfg.rex_batch_size
+    rex.args.iters = cfg.rex_iters
     rex.args.seed = 0
 
     d = Data(
-        input=tensor_to_pil(x, mean=mean, std=std),
+        input=tensor_to_pil(x),
         model_shape=["N", 3, 224, 224],
         device=device,
         mode="RGB",
@@ -142,7 +141,7 @@ def save_rex_example(model, x, y, idx, out_dir, device):
     print("saved", fname)
 
 def sample_rex_examples(model, dataset, out_dir="visualizations/examples", per_class=100, seed=0):
-    device = "cuda"
+    device = get_device()
     model.eval().to(device)
 
     indices = stratified_indices(dataset, per_class=per_class, seed=seed)
@@ -157,17 +156,13 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", default="visualizations/examples")
     parser.add_argument("--per-class", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--epoch", type=int, default=cfg.epochs,
+                        help="Checkpoint to explain (0 = pretrained)")
     args = parser.parse_args()
     
     print("loading model")
-    model = timm.create_model(cfg.model, pretrained=False, num_classes=cfg.num_classes)
-    state = torch.load(f"models/ood_59.pth", map_location = "cpu", weights_only=False)
-    
-    print("sending model to gpu")
-    model.load_state_dict(state)
-
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model.to(device)
+    # models/ood_59.pth was the checkpoint name before the refactor.
+    model = load_model(epoch=args.epoch)
 
     print("getting data")
     data, _ = get_ood()
