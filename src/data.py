@@ -128,7 +128,11 @@ def get_ood(
         transforms.ToTensor()
     ])
 
-    stats_train_base = datasets.ImageNet(root=imagenet_root, split="train", transform=stats_tf)
+    try:
+        stats_train_base = datasets.ImageNet(root=imagenet_root, split="train", transform=stats_tf)
+    except:
+        print("Looks like ImageNet is not installed locally! Try with MNIST")
+        exit()
 
     print("filtering imagenet")
     stats_train_ds = DataLoader(
@@ -157,9 +161,14 @@ def get_ood(
 def get_base(data_root="./data/cifar"):
     print("Loading CIFAR")
     stats_tf = transforms.Compose([transforms.ToTensor()])
-    stats_train_ds = datasets.CIFAR100(
-        root=data_root, train=True, download=True, transform=stats_tf
-    )
+
+    try:
+        stats_train_ds = datasets.CIFAR100(
+            root=data_root, train=True, download=False, transform=stats_tf
+        )
+    except RuntimeError:
+        print("Looks like CIFAR is not installed locally! Try with MNIST")
+        exit()
 
     loader = DataLoader(
         stats_train_ds,
