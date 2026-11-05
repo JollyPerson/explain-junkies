@@ -80,7 +80,7 @@ def _train(model, train_df, test_df, epochs=cfg.epochs, save_every=1):
             # break
 
         scheduler.step()
-        val_loss, val_acc = evaluate(model, test_loader)
+        val_loss, val_acc = evaluate(model, test_loader, device=device)
         print(f"  val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%")
 
         if save_every is not None and epoch % save_every == 0:
@@ -111,9 +111,11 @@ def pretrain():
     return model
 
 
-def train():
-    mix_train, mix_test = get_mixed_dataset()
+def train(use_parquet=False, imagenet_root=None):
+    mix_train, mix_test = get_mixed_dataset(
+        use_parquet=use_parquet,
+        imagenet_root=imagenet_root,
+    )
 
     model = _launch_train(mix_train, mix_test, model=load_model())
     return model
-

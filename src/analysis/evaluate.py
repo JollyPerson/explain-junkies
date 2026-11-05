@@ -43,13 +43,10 @@ def record(data, path="results/ood.csv"):
 
 
 def measure(model, data, idx=""):
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA not available")
-
     if len(data) == 0:
         raise ValueError("Dataset is empty")
 
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     model.eval().to(device)
 
     mean = [0.5071, 0.4867, 0.4408]

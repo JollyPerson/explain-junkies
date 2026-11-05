@@ -24,6 +24,7 @@ dependencies = [
     "rex-xai==0.4.1",
     "numpy==1.26.4",
     "pandas",
+    "pyarrow>=16,<20",
     "matplotlib",
     "pillow",
     "tqdm",

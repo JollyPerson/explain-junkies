@@ -212,9 +212,14 @@ def mix_datasets(a, b, p=0.2, total_size=None, seed=0):
     ])
 
 
-def get_mixed_dataset():
+def get_mixed_dataset(use_parquet=False, imagenet_root=None):
     base_train, base_test = get_base()
-    ood_train, ood_test = get_ood()
+    if use_parquet:
+        from src.parquet_data import get_ood_parquet
+
+        ood_train, ood_test = get_ood_parquet(imagenet_root)
+    else:
+        ood_train, ood_test = get_ood(imagenet_root or "./data/imagenet")
 
     mix_train = mix_datasets(base_train, ood_train)
     mix_test = mix_datasets(base_test, ood_test)
