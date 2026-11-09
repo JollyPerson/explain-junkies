@@ -24,6 +24,8 @@ def main(task, use_parquet=False, imagenet_root=None):
     print(job_id)
     assert job_id, "No job ID"
 
+    os.makedirs(f"models/{cfg.model}", exist_ok=True)
+
     match task:
         case "pretrain": pretrain()
         case "train":
@@ -36,7 +38,7 @@ def main(task, use_parquet=False, imagenet_root=None):
                 )
                 
                 model = load_model(epoch=i)
-                measure(model, mix_test, str(i))
+                measure(model, mix_test, idx=str(i))
 
                 del model
                 if torch.cuda.is_available():

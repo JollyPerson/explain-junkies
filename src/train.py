@@ -30,20 +30,11 @@ def evaluate(model, test_loader, criterion=nn.CrossEntropyLoss(label_smoothing=0
 
 
 
-def _train(model, train_df, test_df, epochs=cfg.epochs, save_every=1):
+def _train(model, train_loader: DataLoader, test_loader: DataLoader, epochs = cfg.epochs, save_every=1):
     print("Launching training")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cudnn.benchmark = True
-
-    train_loader = DataLoader(
-        train_df, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, pin_memory=True, persistent_workers=cfg.num_workers > 0
-    )
-    test_loader = DataLoader(
-        test_df, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=True, persistent_workers=cfg.num_workers > 0
-    )
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
@@ -88,7 +79,7 @@ def _train(model, train_df, test_df, epochs=cfg.epochs, save_every=1):
 
 
 def _launch_train(train, test, model=None, epochs=cfg.epochs, save_every=cfg.save_every):
-    print("Begin mixed training task")
+    print("Begin training task")
     device = "cuda" if torch.cuda.is_available() else 'cpu'
 
     if model is None:
@@ -98,14 +89,14 @@ def _launch_train(train, test, model=None, epochs=cfg.epochs, save_every=cfg.sav
         print(f"Sending model to {device}")
         model.to(device)
     
-    _train(model, train, test, cfg.epochs, save_every=save_every)
+    _train(model, train, test, epochs, save_every=save_every)
     return model
 
 
 def pretrain():
     base_train, base_test = get_base()
     
-    model = _launch_train(base_train, base_test, save_every=None)
+    model = _launch_train(base_train, base_test, epochs=12, save_every=None)
     torch.save(model.state_dict(), pretrained_model_location())
 
     return model

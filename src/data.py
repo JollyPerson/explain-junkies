@@ -128,7 +128,11 @@ def get_ood(
         transforms.ToTensor()
     ])
 
-    stats_train_base = datasets.ImageNet(root=imagenet_root, split="train", transform=stats_tf)
+    try:
+        stats_train_base = datasets.ImageNet(root=imagenet_root, split="train", transform=stats_tf)
+    except:
+        print("Looks like ImageNet is not installed locally! Try with MNIST")
+        exit()
 
     print("filtering imagenet")
     stats_train_ds = DataLoader(
@@ -147,16 +151,24 @@ def get_ood(
     ood_train_ds = FilterByClassIdx(train_base, excluded_idxs)
     ood_val_ds   = FilterByClassIdx(val_base, excluded_idxs)
 
-    return ood_train_ds, ood_val_ds
+    ood_train_loader = DataLoader(ood_train_ds, **dataloader_kwargs)
+    ood_val_loader = DataLoader(ood_val_ds, **dataloader_kwargs)
+
+    return ood_train_loader, ood_val_loader
 
 
 
 def get_base(data_root="./data/cifar"):
     print("Loading CIFAR")
     stats_tf = transforms.Compose([transforms.ToTensor()])
-    stats_train_ds = datasets.CIFAR100(
-        root=data_root, train=True, download=True, transform=stats_tf
-    )
+
+    try:
+        stats_train_ds = datasets.CIFAR100(
+            root=data_root, train=True, download=False, transform=stats_tf
+        )
+    except RuntimeError:
+        print("Looks like CIFAR is not installed locally! Try with MNIST")
+        exit()
 
     loader = DataLoader(
         stats_train_ds,
@@ -180,11 +192,16 @@ def get_base(data_root="./data/cifar"):
         transform=test_tf,
     )
 
-    return train_ds, test_ds
+    train_loader = DataLoader(train_ds, **dataloader_kwargs)
+    test_loader = DataLoader(test_ds, **dataloader_kwargs)
+
+    return train_loader, test_loader
 
 
-def mix_datasets(a, b, p=0.2, total_size=None, seed=0):
+def mix_datasets(a: DataLoader, b: DataLoader, p=0.2, total_size=None, seed=0):
     assert 0.0 <= p <= 1.0
+
+    a, b = a.dataset, b.dataset
 
     if total_size is None:
         if p == 0:
@@ -206,11 +223,12 @@ def mix_datasets(a, b, p=0.2, total_size=None, seed=0):
     idx_a = torch.randperm(len(a), generator=g)[:n_a].tolist()
     idx_b = torch.randperm(len(b), generator=g)[:n_b].tolist()
 
-    return ConcatDataset([
+    mixed = ConcatDataset([
         Subset(a, idx_a),
         Subset(b, idx_b),
     ])
 
+    return DataLoader(mixed, **dataloader_kwargs)
 
 def get_mixed_dataset(use_parquet=False, imagenet_root=None):
     base_train, base_test = get_base()
@@ -225,3 +243,24 @@ def get_mixed_dataset(use_parquet=False, imagenet_root=None):
     mix_test = mix_datasets(base_test, ood_test)
 
     return mix_train, mix_test
+
+
+def stratified_subset(loader: DataLoader, n=100, seed=0):
+    ds = loader.dataset
+    n = min(n, len(ds))
+
+    g = torch.Generator().manual_seed(seed)
+    edges = torch.linspace(0, len(ds), n + 1).long()
+
+    indices = [
+        torch.randint(int(edges[i]), int(edges[i + 1]), (1,), generator=g).item()
+        for i in range(n)
+    ]
+
+    return DataLoader(
+        Subset(ds, indices),
+        batch_size=loader.batch_size,
+        shuffle=False,
+        num_workers=loader.num_workers,
+        pin_memory=loader.pin_memory,
+    )
