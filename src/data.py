@@ -36,7 +36,7 @@ dataloader_kwargs = {
     "batch_size": cfg.batch_size,
     "shuffle": True,
     "num_workers": cfg.num_workers,
-    "pin_memory": True,
+    "pin_memory": torch.cuda.is_available(),
     "persistent_workers": (cfg.num_workers > 0),
 }
 
@@ -159,6 +159,13 @@ def get_ood(
 
 
 def get_base(data_root="./data/cifar"):
+    if cfg.dataset == "mnist":
+        from src.mnist_data import get_mnist
+
+        print("Loading MNIST")
+        train_ds, test_ds = get_mnist()
+        return DataLoader(train_ds, **dataloader_kwargs), DataLoader(test_ds, **dataloader_kwargs)
+
     print("Loading CIFAR")
     stats_tf = transforms.Compose([transforms.ToTensor()])
 
@@ -232,15 +239,20 @@ def mix_datasets(a: DataLoader, b: DataLoader, p=0.2, total_size=None, seed=0):
 
 def get_mixed_dataset(use_parquet=False, imagenet_root=None):
     base_train, base_test = get_base()
-    if use_parquet:
+    if cfg.dataset == "mnist":
+        from src.mnist_data import get_mnist_ood
+
+        print(f"Loading junk data: {cfg.ood_source}")
+        ood_train, ood_test = (DataLoader(d, **dataloader_kwargs) for d in get_mnist_ood())
+    elif use_parquet:
         from src.parquet_data import get_ood_parquet
 
         ood_train, ood_test = get_ood_parquet(imagenet_root)
     else:
         ood_train, ood_test = get_ood(imagenet_root or "./data/imagenet")
 
-    mix_train = mix_datasets(base_train, ood_train)
-    mix_test = mix_datasets(base_test, ood_test)
+    mix_train = mix_datasets(base_train, ood_train, p=cfg.ood_fraction)
+    mix_test = mix_datasets(base_test, ood_test, p=cfg.ood_fraction)
 
     return mix_train, mix_test
 

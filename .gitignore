@@ -8,3 +8,4 @@ models/*
 results/*
 **.pth
 k8s/*
+visualizations/*

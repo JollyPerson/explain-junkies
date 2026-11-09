@@ -1,4 +1,3 @@
-print("test")
 import argparse
 import sys
 import os
@@ -18,25 +17,33 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 cfg = Config()
 
-def main(task, use_parquet=False, imagenet_root=None):
-    print("test")
-    job_id = os.environ.get("JOB_ID", "local")
-    print(job_id)
-    assert job_id, "No job ID"
+def checkpoints(every=1):
+    """0, every, 2*every, ..., always ending with the last epoch."""
+    eps = list(range(0, cfg.epochs + 1, every))
+    if eps[-1] != cfg.epochs:
+        eps.append(cfg.epochs)
+    return eps
 
-    os.makedirs(f"models/{cfg.model}", exist_ok=True)
+
+def main(task, use_parquet=False, imagenet_root=None, every=1):
+    job_id = os.environ.get("JOB_ID", "local")
+    assert job_id, "No job ID"
+    print(f"task={task}  dataset={cfg.dataset}  junk={cfg.ood_source}  model={cfg.model}  job={job_id}")
+
 
     match task:
         case "pretrain": pretrain()
         case "train":
             train(use_parquet=use_parquet, imagenet_root=imagenet_root)
         case "measure":
-            for i in range(cfg.epochs):
-                _, mix_test = get_mixed_dataset(
-                    use_parquet=use_parquet,
-                    imagenet_root=imagenet_root,
-                )
-                
+            # Load the test data once; it is the same for every checkpoint.
+            _, mix_test = get_mixed_dataset(
+                use_parquet=use_parquet,
+                imagenet_root=imagenet_root,
+            )
+            # Checkpoint 0 is the pretrained model (no junk class yet);
+            # 1..epochs are the junk fine-tuning epochs.
+            for i in checkpoints(every):
                 model = load_model(epoch=i)
                 measure(model, mix_test, idx=str(i))
 
@@ -49,7 +56,7 @@ def main(task, use_parquet=False, imagenet_root=None):
                 "train",
                 "measure"
             ]:
-                main(t, use_parquet=use_parquet, imagenet_root=imagenet_root)
+                main(t, use_parquet=use_parquet, imagenet_root=imagenet_root, every=every)
 
 
 if __name__ == "__main__":
@@ -65,5 +72,11 @@ if __name__ == "__main__":
         default=None,
         help="Directory containing ImageNet files or parquet shards",
     )
+    parser.add_argument(
+        "--every",
+        type=int,
+        default=1,
+        help="measure: only explain every Nth checkpoint (plus the first and last)",
+    )
     args = parser.parse_args()
-    main(args.task, use_parquet=args.parquet, imagenet_root=args.imagenet_root)
+    main(args.task, use_parquet=args.parquet, imagenet_root=args.imagenet_root, every=args.every)

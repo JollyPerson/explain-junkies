@@ -1,186 +1,96 @@
-import os
+"""Save example ReX explanations as images, to see what the numbers mean.
+
+    python -m src.analysis.sample --epoch 0 --per-class 3     # pretrained model
+    python -m src.analysis.sample --epoch 10 --per-class 3    # after junk fine-tuning
+
+For each image it writes the input, ReX's responsibility heatmap, and the
+sufficient-explanation mask (the pixels ReX kept), under
+visualizations/<run>/examples/epoch_<N>/.
+"""
+
 import argparse
+import os
 import random
+
+import matplotlib.pyplot as plt
 import torch
-import timm
-from torch.utils.data import Subset
 
-from rex_xai.lib import ReX
-from rex_xai.input.input_data import Data
-
-from src.analysis.evaluate import tensor_to_pil
-from src.data import get_base, get_ood
+from src.analysis.evaluate import explain, explanation_size, make_rex
+from src.analysis.visualize import LABELS
 from src.config import Config
+from src.data import get_mixed_dataset
+from src.mnist_data import tensor_to_image
+from src.utils.load import load_model
+from src.utils.naming import RUN_NAME
+
 cfg = Config()
 
 
-CIFAR100_LABELS = {
-    0: "apple", 1: "aquarium_fish", 2: "baby", 3: "bear", 4: "beaver",
-    5: "bed", 6: "bee", 7: "beetle", 8: "bicycle", 9: "bottle",
-    10: "bowl", 11: "boy", 12: "bridge", 13: "bus", 14: "butterfly",
-    15: "camel", 16: "can", 17: "castle", 18: "caterpillar", 19: "cattle",
-    20: "chair", 21: "chimpanzee", 22: "clock", 23: "cloud", 24: "cockroach",
-    25: "couch", 26: "crab", 27: "crocodile", 28: "cup", 29: "dinosaur",
-    30: "dolphin", 31: "elephant", 32: "flatfish", 33: "forest", 34: "fox",
-    35: "girl", 36: "hamster", 37: "house", 38: "kangaroo", 39: "keyboard",
-    40: "lamp", 41: "lawn_mower", 42: "leopard", 43: "lion", 44: "lizard",
-    45: "lobster", 46: "man", 47: "maple_tree", 48: "motorcycle", 49: "mountain",
-    50: "mouse", 51: "mushroom", 52: "oak_tree", 53: "orange", 54: "orchid",
-    55: "otter", 56: "palm_tree", 57: "pear", 58: "pickup_truck", 59: "pine_tree",
-    60: "plain", 61: "plate", 62: "poppy", 63: "porcupine", 64: "possum",
-    65: "rabbit", 66: "raccoon", 67: "ray", 68: "road", 69: "rocket",
-    70: "rose", 71: "sea", 72: "seal", 73: "shark", 74: "shrew",
-    75: "skunk", 76: "skyscraper", 77: "snail", 78: "snake", 79: "spider",
-    80: "squirrel", 81: "streetcar", 82: "sunflower", 83: "sweet_pepper",
-    84: "table", 85: "tank", 86: "telephone", 87: "television", 88: "tiger",
-    89: "tractor", 90: "train", 91: "trout", 92: "tulip", 93: "turtle",
-    94: "wardrobe", 95: "whale", 96: "willow_tree", 97: "wolf", 98: "woman",
-    99: "worm",
-}
-
-
 def class_name(y):
-    return CIFAR100_LABELS.get(int(y), str(int(y)))
+    return LABELS.get(int(y), str(int(y)))
 
 
-def stratified_indices(dataset, per_class=100, seed=0):
+def stratified_indices(dataset, per_class=3, seed=0, max_scan=5000):
+    """Pick up to per_class random examples of each label."""
     rng = random.Random(seed)
-    by_class = {}
+    order = list(range(len(dataset)))
+    rng.shuffle(order)
+    picked = {}
+    for i in order[:max_scan]:
+        y = int(dataset[i][1])
+        if len(picked.setdefault(y, [])) < per_class:
+            picked[y].append(i)
+    return [i for y in sorted(picked) for i in picked[y]]
 
-    for i in range(len(dataset)):
-        _, y = dataset[i]
-        y = int(y)
-        by_class.setdefault(y, []).append(i)
 
-    selected = []
-
-    for y, indices in sorted(by_class.items()):
-        rng.shuffle(indices)
-        selected.extend(indices[:per_class])
-
-    return selected
-
-def save_rex_example(model, x, y, idx, out_dir, device):
-    import matplotlib.pyplot as plt
-
-    mean = [0.5071, 0.4867, 0.4408]
-    std = [0.2675, 0.2565, 0.2761]
-
-    label = class_name(y)
-
-    heatmap_dir = os.path.join(out_dir, "heatmaps", f"{int(y):03d}_{label}")
-    surface_dir = os.path.join(out_dir, "surface", f"{int(y):03d}_{label}")
-    mask_dir = os.path.join(out_dir, "sufficiency_mask", f"{int(y):03d}_{label}")
-    input_dir = os.path.join(out_dir, "inputs", f"{int(y):03d}_{label}")
-
-    for dpath in [heatmap_dir, surface_dir, mask_dir, input_dir]:
-        os.makedirs(dpath, exist_ok=True)
-
-    x = x.to(device)
-    x_batch = x.unsqueeze(0) if x.ndim == 3 else x
-
-    rex = ReX(model, ["N", 3, 224, 224], device, "RGB")
-    rex.args.minimum_confidence_threshold = 0.5
-    rex.args.batch_size = 128
-    rex.args.seed = 0
-
-    d = Data(
-        input=tensor_to_pil(x, mean=mean, std=std),
-        model_shape=["N", 3, 224, 224],
-        device=device,
-        mode="RGB",
-        process=False,
-    )
-
-    d.data = x_batch
-    rex.data = d
-
-    rex.set_target()
-    rex.calculate_responsibility()
-    rex.generate_explanation_object()
-    rex.extract_sufficient_explanation()
+def save_example(rex, shape, x, y, idx, out_dir, device):
+    explain(rex, shape, x, device)
 
     pred = int(rex.data.target.classification)
-    pred_label = class_name(pred)
+    size = explanation_size(rex)
+    name = f"idx{idx}_true_{class_name(y)}_pred_{class_name(pred)}_size{size:.2f}"
 
-    fname = f"idx_{idx}_true_{int(y)}_{label}_pred_{pred}_{pred_label}"
+    mask = torch.as_tensor(rex.explanation.sufficiency_mask).detach().cpu().squeeze()
+    if mask.ndim == 3:
+        mask = mask.bool().any(dim=0)
 
-    d.input.save(os.path.join(input_dir, fname + ".png"))
-
-    rex.explanation.heatmap_plot(
-        path=os.path.join(heatmap_dir, fname + ".png")
-    )
-
-    rex.explanation.surface_plot(
-        path=os.path.join(surface_dir, fname + ".png")
-    )
-
-    mask = rex.explanation.sufficiency_mask
-
-    if torch.is_tensor(mask):
-        mask = mask.detach().cpu()
-
-    mask = mask.squeeze()
-
-    if mask.ndim == 3 and mask.shape[0] in (1, 3):
-        mask = mask.any(dim=0) if torch.is_tensor(mask) else mask.any(axis=0)
-
-    if torch.is_tensor(mask):
-        mask = mask.numpy()
-
-    plt.figure()
-    plt.imshow(mask, cmap="gray")
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig(
-        os.path.join(mask_dir, fname + ".png"),
-        bbox_inches="tight",
-        pad_inches=0,
-    )
-    plt.close()
-
-    print("saved", fname)
-
-def sample_rex_examples(model, dataset, out_dir="visualizations/examples", per_class=100, seed=0):
-    device = "cuda"
-    model.eval().to(device)
-
-    indices = stratified_indices(dataset, per_class=per_class, seed=seed)
-
-    for idx in indices:
-        x, y = dataset[idx]
-        save_rex_example(model, x, y, idx, out_dir, device)
+    img = tensor_to_image(x)
+    fig, axes = plt.subplots(1, 3, figsize=(9, 3.3))
+    axes[0].imshow(img, cmap="gray")
+    axes[0].set_title(f"input (true {class_name(y)})")
+    resp = rex.maps.get(pred)
+    if resp is not None:
+        axes[1].imshow(resp.squeeze(), cmap="magma")
+    axes[1].set_title("ReX responsibility")
+    kept = torch.as_tensor(x).squeeze().cpu() * mask
+    axes[2].imshow(kept if kept.ndim == 2 else tensor_to_image(kept), cmap="gray")
+    axes[2].set_title(f"kept {size:.0%} -> pred {class_name(pred)}")
+    for ax in axes:
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, name + ".png"), dpi=120)
+    plt.close(fig)
+    print("saved", name)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out-dir", default="visualizations/examples")
-    parser.add_argument("--per-class", type=int, default=100)
+    parser.add_argument("--epoch", type=int, default=cfg.epochs, help="checkpoint; 0 = pretrained")
+    parser.add_argument("--per-class", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--out-dir", default=None)
     args = parser.parse_args()
-    
-    print("loading model")
-    model = timm.create_model(cfg.model, pretrained=False, num_classes=cfg.num_classes)
-    state = torch.load(f"models/ood_59.pth", map_location = "cpu", weights_only=False)
-    
-    print("sending model to gpu")
-    model.load_state_dict(state)
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model.to(device)
+    out_dir = args.out_dir or f"visualizations/{RUN_NAME}/examples/epoch_{args.epoch}"
+    os.makedirs(out_dir, exist_ok=True)
 
-    print("getting data")
-    data, _ = get_ood()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = load_model(epoch=args.epoch).eval()
+    rex, shape = make_rex(model, device)
 
-    generator = torch.Generator().manual_seed(args.seed)
-    indices = torch.randperm(len(data), generator=generator)[:500].tolist()
-    test = Subset(data, indices)
+    _, test_loader = get_mixed_dataset()
+    test = test_loader.dataset
 
-    print("getting examples")
-    sample_rex_examples(
-        model,
-        test,
-        out_dir=args.out_dir,
-        per_class=10,
-        seed=args.seed,
-    )
+    for i in stratified_indices(test, per_class=args.per_class, seed=args.seed):
+        x, y = test[i]
+        save_example(rex, shape, x, y, i, out_dir, device)
