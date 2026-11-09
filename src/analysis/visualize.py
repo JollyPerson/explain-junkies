@@ -3,10 +3,12 @@ import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import timm
-
 from pathlib import Path
-from main import *
+
+from src.config import Config
+from src.mnist_data import MNIST_LABELS
+
+cfg = Config()
 
 CIFAR100_LABELS = {
     0: "apple", 1: "aquarium_fish", 2: "baby", 3: "bear", 4: "beaver",
@@ -30,7 +32,10 @@ CIFAR100_LABELS = {
     89: "tractor", 90: "train", 91: "trout", 92: "tulip", 93: "turtle",
     94: "wardrobe", 95: "whale", 96: "willow_tree", 97: "wolf", 98: "woman",
     99: "worm",
+    100: "junk",
 }
+
+LABELS = MNIST_LABELS if cfg.dataset == "mnist" else CIFAR100_LABELS
 
 
 def read_csv_if_exists(path):
@@ -50,7 +55,7 @@ def clean_frame(df):
 def add_class_labels(df):
     df = df.copy()
     df["class_idx"] = pd.to_numeric(df["class"], errors="coerce").astype("Int64")
-    df["class_label"] = df["class_idx"].map(CIFAR100_LABELS).fillna(df["class"].astype(str))
+    df["class_label"] = df["class_idx"].map(LABELS).fillna(df["class"].astype(str))
     return df
 
 
@@ -254,7 +259,7 @@ def save_per_class_bar_by_selected_idx(df, out_path, selected_idxs=None):
             continue
 
         grouped = grouped.sort_values("exp_mean", ascending=False)
-        bar_color = "green" if int(idx_value) == 59 else None
+        bar_color = "green" if idx_value == selected_idxs[-1] else None
 
         exp_ax.bar(grouped["class_label"], grouped["exp_mean"], color=bar_color)
         exp_ax.set_title(f"Explanation size per class — idx {idx_value}")
@@ -274,41 +279,77 @@ def save_per_class_bar_by_selected_idx(df, out_path, selected_idxs=None):
     plt.close()
 
 
+def save_entropy_vs_size(results_dir, out_path):
+    """Scatter of explanation size against softmax entropy, one dot per image.
+
+    Uses per_image.csv. Colours separate the first and last checkpoint so you
+    can see whether the junk fine-tuning moved the cloud.
+    """
+    frames = [pd.read_csv(p) for p in Path(results_dir).rglob("per_image.csv")]
+    if not frames:
+        print(f"Skipping {out_path}: no per_image.csv")
+        return
+    df = pd.concat(frames, ignore_index=True)
+    df = df[df["true_class"] != cfg.ood_label]  # real classes only
+    first, last = df["idx"].min(), df["idx"].max()
+
+    plt.figure()
+    for idx_value, label in [(first, f"checkpoint {first} (pretrained)"), (last, f"checkpoint {last}")]:
+        rows = df[df["idx"] == idx_value]
+        plt.scatter(rows["norm_entropy"], rows["size"], s=8, alpha=0.6, label=label)
+    plt.xlabel("normalised softmax entropy")
+    plt.ylabel("explanation size")
+    plt.title("Explanation size vs entropy (real classes)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+    for idx_value in sorted(df["idx"].unique()):
+        rows = df[df["idx"] == idx_value]
+        r = rows["norm_entropy"].corr(rows["size"], method="spearman")
+        print(f"checkpoint {idx_value}: spearman(entropy, size) = {r:.3f}  (n={len(rows)})")
+
+
 def visualize(results_dir, out_dir):
     os.makedirs(out_dir, exist_ok=True)
 
-    overall, per_class = collate_results(results_dir)
+    df = collate_results(results_dir)
+    df["idx"] = pd.to_numeric(df["idx"], errors="coerce")
+
+    is_overall = df["class"].astype(str) == "overall"
+    overall = df[is_overall].sort_values(["idx", "job_id"])
+    per_class = df[~is_overall]
 
     overall.to_csv(os.path.join(out_dir, "collated_overall.csv"), index=False)
     per_class.to_csv(os.path.join(out_dir, "collated_per_class.csv"), index=False)
 
-    if "class" in overall.columns:
-        overall = overall[overall["class"].astype(str) == "overall"].copy()
+    # The overall rows mix real and junk images. For the hypothesis we mostly
+    # care about the real classes, so also plot their average separately.
+    real = per_class[pd.to_numeric(per_class["class"], errors="coerce") != cfg.ood_label].copy()
+    real["weighted"] = real["mean"] * real["total"]
+    real_by_idx = real.groupby("idx", as_index=False).agg(
+        weighted=("weighted", "sum"), correct=("correct", "sum"), total=("total", "sum")
+    )
+    real_by_idx["mean"] = real_by_idx["weighted"] / real_by_idx["total"]
+    real_by_idx["accuracy"] = real_by_idx["correct"] / real_by_idx["total"]
 
-    overall = overall.sort_values(["idx", "job_id", "source_file"])
+    for frame, tag in [(overall, "all"), (real_by_idx, "real_classes")]:
+        save_scatter_fit(
+            frame, x="idx", y="mean",
+            out_path=os.path.join(out_dir, f"mean_by_idx_{tag}.png"),
+            title=f"Mean explanation size by checkpoint ({tag})",
+        )
+        save_scatter_fit(
+            frame, x="idx", y="accuracy",
+            out_path=os.path.join(out_dir, f"accuracy_by_idx_{tag}.png"),
+            title=f"Accuracy by checkpoint ({tag})",
+        )
 
     save_scatter_fit(
-        overall,
-        x="idx",
-        y="stdev",
+        overall, x="idx", y="stdev",
         out_path=os.path.join(out_dir, "stdev_by_idx.png"),
-        title="Stdev by idx",
-    )
-
-    save_scatter_fit(
-        overall,
-        x="idx",
-        y="accuracy",
-        out_path=os.path.join(out_dir, "accuracy_by_idx.png"),
-        title="Accuracy by idx",
-    )
-
-    save_scatter_fit(
-        overall,
-        x="idx",
-        y="mean",
-        out_path=os.path.join(out_dir, "mean_by_idx.png"),
-        title="Mean explanation size by idx",
+        title="Stdev of explanation size by checkpoint",
     )
 
     save_per_class_bar(
@@ -321,19 +362,22 @@ def visualize(results_dir, out_dir):
         out_path=os.path.join(out_dir, "top_bottom_classes_by_idx.png"),
     )
 
+    idxs = sorted(per_class["idx"].dropna().unique())
     save_per_class_bar_by_selected_idx(
         per_class,
-        out_path=os.path.join(out_dir, "per_class_explanation_size_idx1_last.png"),
-        selected_idxs=(1, int(pd.to_numeric(per_class["idx"], errors="coerce").max())),
+        out_path=os.path.join(out_dir, "per_class_explanation_size_first_last.png"),
+        selected_idxs=(idxs[0], idxs[-1]),
     )
+
+    save_entropy_vs_size(results_dir, os.path.join(out_dir, "entropy_vs_size.png"))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--results-dir", default="results")
-    parser.add_argument("--out-dir", default="visualizations")
-    args = parser.parse_args()
+    from src.utils.naming import RUN_NAME
 
-    model = timm.create_model(cfg.model, pretrained=False, num_classes=cfg.num_classes)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--results-dir", default=f"results/{RUN_NAME}")
+    parser.add_argument("--out-dir", default=f"visualizations/{RUN_NAME}")
+    args = parser.parse_args()
 
     visualize(args.results_dir, args.out_dir)

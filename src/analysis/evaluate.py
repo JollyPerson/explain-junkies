@@ -1,31 +1,44 @@
-import torch
-import statistics
-from torch.utils.data import DataLoader
-import os
+"""Measure how explainable a checkpoint is, using ReX.
+
+For each test image, ReX finds a *sufficient explanation*: the smallest set of
+pixels that, kept on their own (everything else masked to 0), still makes the
+model give the same prediction. The explanation size is that set's share of
+the image. The hypothesis is that adding a junk class makes these sets bigger,
+which means the model is less explainable.
+
+Outputs, under results/<model>/<JOB_ID>/:
+  per_class.csv  one row per (checkpoint, class): mean/stdev size, accuracy,
+                 plus an "overall" row per checkpoint (used by visualize.py)
+  per_image.csv  one row per explained image: size, true/pred class,
+                 softmax entropy and junk-class probability
+"""
+
 import csv
+import functools
+import math
+import os
+import statistics
 
-from rex_xai.lib import ReX
+import rex_xai.explanation.explanation as _rex_explanation
+import torch
 from rex_xai.input.input_data import Data
+from rex_xai.lib import ReX
+from tqdm import tqdm
 
-from src.utils.naming import results_location
 from src.config import Config
+from src.data import stratified_subset
+from src.mnist_data import tensor_to_image
+from src.utils.naming import results_location
+
 cfg = Config()
 
-from PIL import Image
+# ReX draws a progress bar for every explanation it extracts, ignoring
+# args.progress_bar. With hundreds of images that floods the log, so mute it.
+_rex_explanation.tqdm = functools.partial(tqdm, disable=True)
 
-job_id = os.environ.get("JOB_ID", "local")
-assert job_id, "No job ID"
-
-
-def tensor_to_pil(x, mean, std):
-    # x: [3, H, W]
-    x = x.detach().cpu().clone()
-    mean = torch.tensor(mean).view(3, 1, 1)
-    std = torch.tensor(std).view(3, 1, 1)
-    x = x * std + mean
-    x = x.clamp(0, 1)
-    x = (x * 255).byte().permute(1, 2, 0).numpy()
-    return Image.fromarray(x)
+# Kept for sample.py, which imports it.
+def tensor_to_pil(x, mean=None, std=None):
+    return tensor_to_image(x)
 
 
 def record(data, path="results/ood.csv"):
@@ -42,111 +55,118 @@ def record(data, path="results/ood.csv"):
         writer.writerow(data)
 
 
-def measure(model, data, idx=""):
+def make_rex(model, device):
+    """Build a ReX explainer configured for the current dataset's image size."""
+    shape = ["N", *cfg.image_shape]
+    # "RGB" is ReX's image mode. It reads the channel count from the shape, so
+    # a [N, 1, 28, 28] shape works for greyscale MNIST too.
+    rex = ReX(model, shape, device, "RGB")
+    rex.args.minimum_confidence_threshold = 0.5
+    rex.args.batch_size = cfg.rex_batch_size
+    rex.args.seed = cfg.seed
+    rex.args.min_box_size = cfg.rex_min_box_size
+    rex.args.chunk_size = cfg.rex_min_box_size
+    rex.args.iters = cfg.rex_iters
+    rex.args.insertion_step = cfg.rex_insertion_step
+    rex.args.progress_bar = False
+    rex.args.verbosity = 0
+    return rex, shape
+
+
+def explain(rex, shape, x, device):
+    """Run ReX on one image x ([C, H, W]). Returns the filled-in rex object."""
+    x = x.to(device)
+    d = Data(
+        input=tensor_to_image(x),
+        model_shape=shape,
+        device=device,
+        mode="RGB",
+        process=False,  # we hand ReX the already-transformed tensor below
+    )
+    d.data = x.unsqueeze(0)
+    rex.data = d
+
+    rex.set_target()
+    rex.calculate_responsibility()
+    rex.generate_explanation_object()
+    rex.extract_sufficient_explanation()
+    return rex
+
+
+def explanation_size(rex):
+    """Share of pixels in the sufficient explanation, in [0, 1]."""
+    mask = rex.explanation.sufficiency_mask
+    mask = torch.as_tensor(mask).squeeze()
+    if mask.ndim == 3:  # [C, H, W]: a pixel counts if any channel is kept
+        mask = mask.bool().any(dim=0)
+    return torch.count_nonzero(mask).item() / mask.numel()
+
+
+def measure(model, data, n_samples=cfg.test_size, idx=""):
     if len(data) == 0:
         raise ValueError("Dataset is empty")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.eval().to(device)
 
-    mean = [0.5071, 0.4867, 0.4408]
-    std = [0.2675, 0.2565, 0.2761]
-
-    loader = DataLoader(
-        data,
-        batch_size=1,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True,
-    )
-
-    rex = ReX(model, ["N", 3, 224, 224], device, "RGB")
-    rex.args.minimum_confidence_threshold = 0.5
-    rex.args.batch_size = 128
-    rex.args.seed = 0
+    loader = stratified_subset(data, n_samples, seed=cfg.seed)
+    rex, shape = make_rex(model, device)
+    out_dir = results_location()
 
     results = []
+    for batch_x, batch_y in loader:
+        for x, y in zip(batch_x, batch_y):
+            with torch.no_grad():
+                probs = torch.softmax(model(x.unsqueeze(0).to(device)).float(), dim=1)[0].cpu()
+            entropy = -(probs * probs.clamp_min(1e-12).log()).sum().item()
 
-    correct = 0
-    total = 0
+            explain(rex, shape, x, device)
 
-    for x, y in loader:
-        x = x.squeeze(0).to(device, non_blocking=True)
-        y = y.to(device)
+            true_class = int(y)
+            pred_class = int(rex.data.target.classification)
+            size = explanation_size(rex)
 
-        if x.ndim == 3:
-            x_batch = x.unsqueeze(0)
-        else:
-            x_batch = x
+            row = {
+                "idx": idx,
+                "true_class": true_class,
+                "pred_class": pred_class,
+                "correct": int(pred_class == true_class),
+                "size": size,
+                "confidence": probs[pred_class].item(),
+                "entropy": entropy,
+                # entropy as a share of its maximum, log(num_classes)
+                "norm_entropy": entropy / math.log(len(probs)),
+                "p_junk": probs[cfg.ood_label].item(),
+            }
+            results.append(row)
+            record(row, f"{out_dir}/per_image.csv")
 
-        d = Data(
-            input=tensor_to_pil(x, mean=mean, std=std),
-            model_shape=["N", 3, 224, 224],
-            device=device,
-            mode="RGB",
-            process=False,
-        )
+            if len(results) % 25 == 0:
+                sizes = [r["size"] for r in results]
+                acc = sum(r["correct"] for r in results) / len(results)
+                print(f"  [{idx}] {len(results)}/{n_samples}  mean size={statistics.mean(sizes):.3f}  acc={acc:.3f}")
 
-        d.data = x_batch
-        rex.data = d
+    groups = {"overall": results}
+    for cls in sorted({r["true_class"] for r in results}):
+        groups[cls] = [r for r in results if r["true_class"] == cls]
 
-        rex.set_target()
-
-        pred_class = int(rex.data.target.classification)
-        true_class = int(y.item())
-        is_correct = pred_class == true_class
-
-        correct += int(is_correct)
-        total += 1
-
-        rex.calculate_responsibility()
-        rex.generate_explanation_object()
-        rex.extract_sufficient_explanation()
-
-        mask = rex.explanation.sufficiency_mask
-        size = torch.count_nonzero(mask).item() / mask.numel()
-
-        results.append(
-            (size, true_class, pred_class, is_correct)
-        )
-
-        if total % 10 == 0:
-            sizes = [r[0] for r in results]
-
-            print("mean:", sum(sizes) / len(sizes))
-            print(
-                "stdev:",
-                statistics.stdev(sizes)
-                if len(sizes) > 1
-                else 0.0,
-            )
-            print("accuracy:", correct / total)
-
-    sizes = [r[0] for r in results]
-
-    
-    # Results shape: (size, true_class, pred_class, is_correct)
-    for cls in sorted(set(r[1] for r in results)):
-        cls_rows = [r for r in results if r[1] == cls]
-
-        cls_sizes = [r[0] for r in cls_rows]
-        cls_correct = sum(1 for r in cls_rows if r[3])
-        cls_total = len(cls_rows)
-
+    for cls, rows in groups.items():
+        sizes = [r["size"] for r in rows]
+        correct = sum(r["correct"] for r in rows)
         record(
             {
                 "idx": idx,
                 "class": cls,
-                "mean": sum(cls_sizes) / len(cls_sizes),
-                "stdev": (
-                    statistics.stdev(cls_sizes)
-                    if len(cls_sizes) > 1
-                    else 0.0
-                ),
-                "accuracy": cls_correct / cls_total,
-                "correct": cls_correct,
-                "total": cls_total,
+                "mean": statistics.mean(sizes),
+                "stdev": statistics.stdev(sizes) if len(sizes) > 1 else 0.0,
+                "accuracy": correct / len(rows),
+                "correct": correct,
+                "total": len(rows),
             },
-            f"{results_location(cfg.model)}/per_class.csv",
+            f"{out_dir}/per_class.csv",
         )
+
+    sizes = [r["size"] for r in results]
+    acc = sum(r["correct"] for r in results) / len(results)
+    print(f"checkpoint {idx}: mean explanation size={statistics.mean(sizes):.3f}  accuracy={acc:.3f}")
+    return results

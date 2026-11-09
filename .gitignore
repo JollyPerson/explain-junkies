@@ -7,5 +7,5 @@ imagenet/*
 models/*
 results/*
 **.pth
-**.txt
 k8s/*
+visualizations/*
