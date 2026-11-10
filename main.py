@@ -15,7 +15,7 @@ def run_measure(args):
     # Heavy imports (rex_xai) only when measuring.
     from src.analysis.evaluate import measure, stratified_subset, per_class_path
     from src.data import get_mixed_dataset
-    from src.utils.load import create_model, load_weights
+    from src.utils.load import create_model, load_weights, checkpoint_location
     from src.utils.device import get_device
 
     if args.epoch:
@@ -23,9 +23,17 @@ def run_measure(args):
     else:
         # 0 is the pretrained model; training saves epochs 1..cfg.epochs, so
         # include the last one (the old range(cfg.epochs) stopped one short).
-        epochs = list(range(0, cfg.epochs + 1, args.every))
+        # --every defaults to --save-every, so a run trained with
+        # --save-every 5 is measured at 0, 5, 10, ... without a second flag.
+        every = args.every or args.save_every or cfg.save_every
+        epochs = list(range(0, cfg.epochs + 1, every))
         if epochs[-1] != cfg.epochs:
             epochs.append(cfg.epochs)
+        never_saved = [e for e in epochs if not os.path.exists(checkpoint_location(e))]
+        if never_saved:
+            print(f"No checkpoint file for epochs {never_saved}, skipping them "
+                  "(trained with a larger --save-every?)")
+            epochs = [e for e in epochs if e not in never_saved]
 
     todo = [e for e in epochs if args.overwrite or not os.path.exists(per_class_path(e))]
     skipped = sorted(set(epochs) - set(todo))
@@ -49,7 +57,8 @@ def run_measure(args):
 def main(args):
     job_id = os.environ.get("JOB_ID", "local")
     assert job_id, "No job ID"
-    train_kwargs = dict(precision=args.precision, compile_model=args.compile, resume=args.resume)
+    train_kwargs = dict(precision=args.precision, compile_model=args.compile, resume=args.resume,
+                        save_every=args.save_every or cfg.save_every)
 
     match args.task:
         case "prepare":
@@ -89,19 +98,29 @@ def parse_args(argv=None):
                             help="torch.compile the model (needs a Volta or newer GPU)")
     train_opts.add_argument("--resume", action="store_true",
                             help="Carry on from the last finished epoch after a crash or Ctrl+C")
+    train_opts.add_argument("--save-every", type=int, default=None,
+                            help="Keep weights only every N epochs, plus the last one "
+                                 f"(default cfg.save_every = {cfg.save_every}). "
+                                 "Applies to pretrain and train; measure follows it")
 
     m = parser.add_argument_group("measure")
     m.add_argument("--epoch", type=int, nargs="+",
                    help="Measure only these checkpoints, e.g. --epoch 17 for one job per checkpoint")
-    m.add_argument("--every", type=int, default=1,
-                   help="Measure every Nth checkpoint (the last one is always included)")
+    m.add_argument("--every", type=int, default=None,
+                   help="Measure every Nth checkpoint (the last one is always included). "
+                        "Defaults to --save-every; checkpoints never saved are skipped")
     m.add_argument("--per-class", type=int, default=None,
                    help="Measure a fixed random subset of N images per class instead of all 12,500")
     m.add_argument("--rex-precision", choices=("fp32", "bf16", "fp16", "auto"), default="fp32",
                    help="Autocast dtype for ReX's forward passes. fp32 matches the original numbers")
     m.add_argument("--overwrite", action="store_true",
                    help="Re-measure checkpoints that already have results")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    for name in ("every", "save_every"):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            parser.error(f"--{name.replace('_', '-')} must be 1 or more")
+    return args
 
 
 if __name__ == "__main__":

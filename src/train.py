@@ -129,7 +129,8 @@ def _train(model, train_ds, test_ds, epochs=cfg.epochs, save_every=1,
         val_loss, val_acc = evaluate(step_model, test_loader, criterion, device, dtype)
         print(f"  train_loss={running_loss.item() / n:.4f}  val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%")
 
-        if save_every is not None and epoch % save_every == 0:
+        # The last epoch is always kept, so measure can rely on it existing.
+        if save_every is not None and (epoch % save_every == 0 or epoch == epochs):
             path = model_location(epoch) if phase == "train" else pretrain_epoch_location(epoch)
             _save(model.state_dict(), path)
 
