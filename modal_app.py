@@ -8,9 +8,13 @@ One-time setup on your own machine:
     rclone copy r2:ooddata/ooddata/junk_cache ./junk_cache -P
     modal volume put ood-data ./junk_cache data/junk_cache
 
+Always use --detach: the entrypoint only starts the work and exits, and
+without --detach Modal stops the app as soon as it does. Watch with
+`modal app logs <app-id>` (`modal app list` shows the id).
+
 Run (from the repo root, on this branch):
     # 2-minute smoke test first
-    modal run modal_app.py --job-id smoke --smoke --args "--save-every 2"
+    modal run --detach modal_app.py --job-id smoke --smoke --args "--save-every 2"
 
     # the real run; --detach keeps it going after you close the laptop
     modal run --detach modal_app.py --job-id vit1 --args "--save-every 5 --per-class 50"
@@ -141,17 +145,12 @@ def _measure_all(job_id, epochs, args, smoke):
     """Start one L4 container per checkpoint, all running at the same time."""
     todo = [int(e) for e in epochs.split(",") if e.strip()]
     print(f"Measuring checkpoints {todo} on {MEASURE_GPU}, one container each, args={args!r}")
-    calls = {e: measure_one.spawn(job_id, e, args, smoke) for e in todo}
-    failed = []
-    for e, call in calls.items():
-        try:
-            call.get()
-            print(f"checkpoint {e}: done")
-        except Exception as err:  # keep waiting for the others
-            print(f"checkpoint {e}: FAILED ({err})")
-            failed.append(e)
-    if failed:
-        print(f"Rerun just these with --epochs {','.join(map(str, failed))}")
+    # spawn, not remote: the calls keep running after this local process
+    # exits, so closing the terminal (or Ctrl+C) can't cancel them.
+    for e in todo:
+        call = measure_one.spawn(job_id, e, args, smoke)
+        print(f"checkpoint {e}: started ({call.object_id})")
+    print("Follow progress with: modal app logs <app-id>  (modal app list shows the id)")
 
 
 @app.local_entrypoint()
@@ -161,5 +160,9 @@ def main(job_id: str = "modal", task: str = "all", args: str = "", smoke: bool =
         _measure_all(job_id, epochs, args, smoke)
     else:
         print(f"Starting task={task} job_id={job_id} gpu={GPU} smoke={smoke} args={args!r}")
-        run.remote(job_id, task, args, smoke)
-    print("Done. Fetch results with: modal volume get ood-data results ./results")
+        # spawn, not remote: with --detach the run carries on after this local
+        # process exits, so closing the terminal (or Ctrl+C) can't cancel it.
+        call = run.spawn(job_id, task, args, smoke)
+        print(f"Started {call.object_id}. Follow it with: modal app logs <app-id>"
+              "  (modal app list shows the id)")
+    print("When it's finished: modal volume get ood-data results ./results")
