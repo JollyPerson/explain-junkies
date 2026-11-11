@@ -1,5 +1,6 @@
 import csv
 import os
+import math
 import statistics
 
 import torch
@@ -7,7 +8,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from PIL import Image
 
+import functools
+
+import rex_xai.explanation.explanation as _rex_explanation
 from rex_xai.lib import ReX
+from tqdm import tqdm
 from rex_xai.input.input_data import Data
 from rex_xai.responsibility.prediction import Prediction
 
@@ -16,6 +21,10 @@ from src.utils.naming import results_location
 from src.utils.device import get_device, amp_dtype, autocast
 from src.config import Config, MEAN, STD
 cfg = Config()
+
+# ReX draws a progress bar for every image it explains, which floods the log
+# with thousands of lines. Turn those bars off.
+_rex_explanation.tqdm = functools.partial(tqdm, disable=True)
 
 
 def tensor_to_pil(x, mean=MEAN, std=STD):
@@ -103,6 +112,11 @@ def per_image_path(epoch, model_name=cfg.model):
     return os.path.join(results_location(model_name), f"per_image_epoch_{int(epoch):03d}.csv")
 
 
+def _sizes(rows):
+    """Explanation sizes, leaving out images ReX found no explanation for (NaN)."""
+    return [r["size"] for r in rows if not math.isnan(r["size"])]
+
+
 def measure(model, data, idx="", precision="fp32"):
     """Run ReX on every image in `data` and write two CSVs for checkpoint `idx`:
     one row per image, and the per-class summary (mean, stdev, accuracy).
@@ -130,9 +144,11 @@ def measure(model, data, idx="", precision="fp32"):
     rex.args.batch_size = cfg.rex_batch_size
     rex.args.iters = cfg.rex_iters
     rex.args.seed = 0
+    rex.args.progress_bar = False
 
     rows = []
     correct = 0
+    no_explanation = 0
 
     for i, (x, y) in enumerate(loader):
         x = x.to(device, non_blocking=True)  # [1, 3, 224, 224]
@@ -156,11 +172,18 @@ def measure(model, data, idx="", precision="fp32"):
         correct += int(is_correct)
 
         rex.calculate_responsibility()
-        rex.generate_explanation_object()
-        rex.extract_sufficient_explanation()
-
-        mask = rex.explanation.sufficiency_mask
-        size = torch.count_nonzero(mask).item() / mask.numel()
+        if rex.maps is None or rex.maps.get(rex.data.target.classification) is None:
+            # No occluded version of the image kept the predicted class, so ReX
+            # has no responsibility map to build an explanation from. Happens
+            # with low-confidence predictions (e.g. the untrained SMOKE model).
+            # Record it, but leave it out of the size averages.
+            size = float("nan")
+            no_explanation += 1
+        else:
+            rex.generate_explanation_object()
+            rex.extract_sufficient_explanation()
+            mask = rex.explanation.sufficiency_mask
+            size = torch.count_nonzero(mask).item() / mask.numel()
 
         rows.append({
             "idx": idx,
@@ -173,25 +196,27 @@ def measure(model, data, idx="", precision="fp32"):
         })
 
         if (i + 1) % 50 == 0:
-            sizes = [r["size"] for r in rows]
-            print(f"[{i + 1}/{len(data)}] mean={statistics.fmean(sizes):.4f} "
-                  f"accuracy={correct / len(rows):.4f}")
+            sizes = _sizes(rows)
+            mean = statistics.fmean(sizes) if sizes else float("nan")
+            print(f"[{i + 1}/{len(data)}] mean={mean:.4f} "
+                  f"accuracy={correct / len(rows):.4f}  no_explanation={no_explanation}")
 
     _write_csv(per_image_path(idx), rows)
 
     summary = []
     for cls in sorted({r["true_class"] for r in rows}):
         cls_rows = [r for r in rows if r["true_class"] == cls]
-        cls_sizes = [r["size"] for r in cls_rows]
+        cls_sizes = _sizes(cls_rows)
         cls_correct = sum(r["correct"] for r in cls_rows)
         summary.append({
             "idx": idx,
             "class": cls,
-            "mean": statistics.fmean(cls_sizes),
+            "mean": statistics.fmean(cls_sizes) if cls_sizes else float("nan"),
             "stdev": statistics.stdev(cls_sizes) if len(cls_sizes) > 1 else 0.0,
             "accuracy": cls_correct / len(cls_rows),
             "correct": cls_correct,
             "total": len(cls_rows),
+            "no_explanation": len(cls_rows) - len(cls_sizes),
         })
     _write_csv(per_class_path(idx), summary)
 
