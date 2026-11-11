@@ -122,8 +122,10 @@ def run(job_id: str, task: str, args: str, smoke: bool):
 @app.function(
     image=image,
     gpu=MEASURE_GPU,
-    cpu=8,                  # one core per ReX worker process, plus spare
-    memory=32768,           # MB; each worker holds its own model and data copy
+    # One ReX process uses about 1 core and 10 GB. Raise these with --workers
+    # (roughly 1 core and 4 GB more per extra worker).
+    cpu=2,
+    memory=16384,           # MB
     volumes={VOL_DIR: vol},
     timeout=24 * 60 * 60,
 )
