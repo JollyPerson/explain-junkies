@@ -2,6 +2,7 @@ import csv
 import os
 import math
 import statistics
+import time
 
 import torch
 import torch.nn.functional as F
@@ -149,6 +150,7 @@ def measure(model, data, idx="", precision="fp32"):
     rows = []
     correct = 0
     no_explanation = 0
+    start = time.time()
 
     for i, (x, y) in enumerate(loader):
         x = x.to(device, non_blocking=True)  # [1, 3, 224, 224]
@@ -198,9 +200,13 @@ def measure(model, data, idx="", precision="fp32"):
         if (i + 1) % 50 == 0:
             sizes = _sizes(rows)
             mean = statistics.fmean(sizes) if sizes else float("nan")
+            per_img = (time.time() - start) / (i + 1)
+            eta_min = per_img * (len(data) - i - 1) / 60
             print(f"[{i + 1}/{len(data)}] mean={mean:.4f} "
-                  f"accuracy={correct / len(rows):.4f}  no_explanation={no_explanation}")
+                  f"accuracy={correct / len(rows):.4f}  no_explanation={no_explanation}  "
+                  f"{per_img:.2f}s/image  checkpoint ETA {eta_min:.0f} min")
 
+    print(f"checkpoint {idx}: {len(rows)} images explained in {(time.time() - start) / 60:.1f} min")
     _write_csv(per_image_path(idx), rows)
 
     summary = []
