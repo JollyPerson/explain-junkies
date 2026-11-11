@@ -13,7 +13,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 def run_measure(args):
     # Heavy imports (rex_xai) only when measuring.
-    from src.analysis.evaluate import measure, stratified_subset, per_class_path
+    from src.analysis.evaluate import measure, measure_parallel, stratified_subset, per_class_path
     from src.data import get_mixed_dataset
     from src.utils.load import create_model, load_weights, checkpoint_location
     from src.utils.device import get_device
@@ -45,6 +45,12 @@ def run_measure(args):
     # Build the dataset and the model once, not once per checkpoint.
     _, mix_test = get_mixed_dataset(use_parquet=args.parquet, imagenet_root=args.imagenet_root)
     data = stratified_subset(mix_test, args.per_class, seed=0)
+
+    if args.workers > 1:
+        # Each worker process loads its own model, so none is built here.
+        for epoch in todo:
+            measure_parallel(epoch, data, args.workers, precision=args.rex_precision)
+        return
 
     model = create_model().to(get_device())
     for epoch in todo:
@@ -113,10 +119,13 @@ def parse_args(argv=None):
                    help="Measure a fixed random subset of N images per class instead of all 12,500")
     m.add_argument("--rex-precision", choices=("fp32", "bf16", "fp16", "auto"), default="fp32",
                    help="Autocast dtype for ReX's forward passes. fp32 matches the original numbers")
+    m.add_argument("--workers", type=int, default=1,
+                   help="Explain images in N processes sharing the GPU. ReX is mostly "
+                        "single-threaded Python, so 4-6 workers run several times faster")
     m.add_argument("--overwrite", action="store_true",
                    help="Re-measure checkpoints that already have results")
     args = parser.parse_args(argv)
-    for name in ("every", "save_every"):
+    for name in ("every", "save_every", "workers"):
         value = getattr(args, name)
         if value is not None and value < 1:
             parser.error(f"--{name.replace('_', '-')} must be 1 or more")

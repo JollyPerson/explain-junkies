@@ -118,6 +118,95 @@ def _sizes(rows):
     return [r["size"] for r in rows if not math.isnan(r["size"])]
 
 
+def _make_rex(model, device, dtype):
+    rex = ReX(model, ["N", 3, 224, 224], device, "RGB",
+              prediction_function=make_prediction_function(model, device, dtype))
+    rex.args.minimum_confidence_threshold = 0.5
+    rex.args.batch_size = cfg.rex_batch_size
+    rex.args.iters = cfg.rex_iters
+    # ReX reseeds from this at the start of every image, so each image's
+    # random splits are the same whatever order (or process) explains it.
+    rex.args.seed = 0
+    rex.args.progress_bar = False
+    return rex
+
+
+def _explain_one(rex, x, y, idx, image):
+    """Run ReX on one image ([1, 3, 224, 224] on the device) and return its row."""
+    d = Data(
+        input=tensor_to_pil(x.squeeze(0)),
+        model_shape=["N", 3, 224, 224],
+        device=x.device.type,
+        mode="RGB",
+        process=False,
+    )
+    d.data = x
+    rex.data = d
+
+    rex.set_target()
+
+    pred_class = int(rex.data.target.classification)
+    true_class = int(y)
+
+    rex.calculate_responsibility()
+    if rex.maps is None or rex.maps.get(rex.data.target.classification) is None:
+        # No occluded version of the image kept the predicted class, so ReX
+        # has no responsibility map to build an explanation from. Happens
+        # with low-confidence predictions (e.g. the untrained SMOKE model).
+        # Record it, but leave it out of the size averages.
+        size = float("nan")
+    else:
+        rex.generate_explanation_object()
+        rex.extract_sufficient_explanation()
+        mask = rex.explanation.sufficiency_mask
+        size = torch.count_nonzero(mask).item() / mask.numel()
+
+    return {
+        "idx": idx,
+        "image": image,
+        "true_class": true_class,
+        "pred_class": pred_class,
+        "correct": int(pred_class == true_class),
+        "confidence": float(rex.data.target.confidence),
+        "size": size,
+    }
+
+
+def _progress(rows, done, total, start, prefix=""):
+    sizes = _sizes(rows)
+    mean = statistics.fmean(sizes) if sizes else float("nan")
+    correct = sum(r["correct"] for r in rows)
+    no_explanation = len(rows) - len(sizes)
+    per_img = (time.time() - start) / done
+    eta_min = per_img * (total - done) / 60
+    print(f"{prefix}[{done}/{total}] mean={mean:.4f} "
+          f"accuracy={correct / len(rows):.4f}  no_explanation={no_explanation}  "
+          f"{per_img:.2f}s/image  checkpoint ETA {eta_min:.0f} min", flush=True)
+
+
+def _write_results(idx, rows):
+    """Write the per-image CSV and the per-class summary for checkpoint `idx`."""
+    rows = sorted(rows, key=lambda r: r["image"])
+    _write_csv(per_image_path(idx), rows)
+
+    summary = []
+    for cls in sorted({r["true_class"] for r in rows}):
+        cls_rows = [r for r in rows if r["true_class"] == cls]
+        cls_sizes = _sizes(cls_rows)
+        cls_correct = sum(r["correct"] for r in cls_rows)
+        summary.append({
+            "idx": idx,
+            "class": cls,
+            "mean": statistics.fmean(cls_sizes) if cls_sizes else float("nan"),
+            "stdev": statistics.stdev(cls_sizes) if len(cls_sizes) > 1 else 0.0,
+            "accuracy": cls_correct / len(cls_rows),
+            "correct": cls_correct,
+            "total": len(cls_rows),
+            "no_explanation": len(cls_rows) - len(cls_sizes),
+        })
+    _write_csv(per_class_path(idx), summary)
+
+
 def measure(model, data, idx="", precision="fp32"):
     """Run ReX on every image in `data` and write two CSVs for checkpoint `idx`:
     one row per image, and the per-class summary (mean, stdev, accuracy).
@@ -138,92 +227,90 @@ def measure(model, data, idx="", precision="fp32"):
         num_workers=cfg.num_workers,
         pin_memory=(device == "cuda"),
     )
-
-    rex = ReX(model, ["N", 3, 224, 224], device, "RGB",
-              prediction_function=make_prediction_function(model, device, dtype))
-    rex.args.minimum_confidence_threshold = 0.5
-    rex.args.batch_size = cfg.rex_batch_size
-    rex.args.iters = cfg.rex_iters
-    rex.args.seed = 0
-    rex.args.progress_bar = False
+    rex = _make_rex(model, device, dtype)
 
     rows = []
-    correct = 0
-    no_explanation = 0
     start = time.time()
-
     for i, (x, y) in enumerate(loader):
         x = x.to(device, non_blocking=True)  # [1, 3, 224, 224]
-        x0 = x.squeeze(0)
-
-        d = Data(
-            input=tensor_to_pil(x0),
-            model_shape=["N", 3, 224, 224],
-            device=device,
-            mode="RGB",
-            process=False,
-        )
-        d.data = x
-        rex.data = d
-
-        rex.set_target()
-
-        pred_class = int(rex.data.target.classification)
-        true_class = int(y.item())
-        is_correct = pred_class == true_class
-        correct += int(is_correct)
-
-        rex.calculate_responsibility()
-        if rex.maps is None or rex.maps.get(rex.data.target.classification) is None:
-            # No occluded version of the image kept the predicted class, so ReX
-            # has no responsibility map to build an explanation from. Happens
-            # with low-confidence predictions (e.g. the untrained SMOKE model).
-            # Record it, but leave it out of the size averages.
-            size = float("nan")
-            no_explanation += 1
-        else:
-            rex.generate_explanation_object()
-            rex.extract_sufficient_explanation()
-            mask = rex.explanation.sufficiency_mask
-            size = torch.count_nonzero(mask).item() / mask.numel()
-
-        rows.append({
-            "idx": idx,
-            "image": i,
-            "true_class": true_class,
-            "pred_class": pred_class,
-            "correct": int(is_correct),
-            "confidence": float(rex.data.target.confidence),
-            "size": size,
-        })
-
+        rows.append(_explain_one(rex, x, y.item(), idx, i))
         if (i + 1) % 50 == 0:
-            sizes = _sizes(rows)
-            mean = statistics.fmean(sizes) if sizes else float("nan")
-            per_img = (time.time() - start) / (i + 1)
-            eta_min = per_img * (len(data) - i - 1) / 60
-            print(f"[{i + 1}/{len(data)}] mean={mean:.4f} "
-                  f"accuracy={correct / len(rows):.4f}  no_explanation={no_explanation}  "
-                  f"{per_img:.2f}s/image  checkpoint ETA {eta_min:.0f} min")
+            _progress(rows, i + 1, len(data), start)
 
     print(f"checkpoint {idx}: {len(rows)} images explained in {(time.time() - start) / 60:.1f} min")
-    _write_csv(per_image_path(idx), rows)
+    _write_results(idx, rows)
+    return rows
 
-    summary = []
-    for cls in sorted({r["true_class"] for r in rows}):
-        cls_rows = [r for r in rows if r["true_class"] == cls]
-        cls_sizes = _sizes(cls_rows)
-        cls_correct = sum(r["correct"] for r in cls_rows)
-        summary.append({
-            "idx": idx,
-            "class": cls,
-            "mean": statistics.fmean(cls_sizes) if cls_sizes else float("nan"),
-            "stdev": statistics.stdev(cls_sizes) if len(cls_sizes) > 1 else 0.0,
-            "accuracy": cls_correct / len(cls_rows),
-            "correct": cls_correct,
-            "total": len(cls_rows),
-            "no_explanation": len(cls_rows) - len(cls_sizes),
-        })
-    _write_csv(per_class_path(idx), summary)
 
+# ---------------------------------------------------------------------------
+# Parallel measure: several processes share one GPU.
+#
+# ReX spends most of its time in single-threaded Python between small GPU
+# calls, so one process leaves the GPU idle most of the time. Each worker
+# loads its own copy of the model and explains every Nth image (image i goes
+# to worker i % workers). Results are identical to the single-process version
+# because ReX reseeds for every image; only the order of work changes.
+# ---------------------------------------------------------------------------
+
+_worker_data = None
+
+
+def _init_worker(data):
+    global _worker_data
+    _worker_data = data
+    # Every worker has its own Python thread; extra torch CPU threads per
+    # worker would just fight each other for the same cores.
+    torch.set_num_threads(1)
+
+
+def _worker(job):
+    from src.utils.load import create_model, load_weights
+
+    epoch, rank, workers, precision = job
+    device = get_device()
+    dtype = amp_dtype(device, precision)
+    model = create_model()
+    load_weights(model, epoch)
+    model.eval().to(device)
+    rex = _make_rex(model, device, dtype)
+
+    data = _worker_data
+    mine = list(range(rank, len(data), workers))
+    rows = []
+    start = time.time()
+    for n, i in enumerate(mine):
+        x, y = data[i]
+        x = x.unsqueeze(0).to(device)
+        rows.append(_explain_one(rex, x, int(y), str(epoch), i))
+        # Worker 0 reports for everyone; the others run at the same speed.
+        if rank == 0 and (n + 1) % 25 == 0:
+            done = (n + 1) * workers
+            _progress(rows, done, len(data), start, prefix=f"[worker 0 of {workers}] ")
+    return rows
+
+
+def measure_parallel(epoch, data, workers, precision="fp32"):
+    """Same output as measure(), using `workers` processes on one GPU.
+
+    Builds the models inside the workers, so the caller must not have
+    loaded a model onto the GPU itself (CUDA cannot be shared that way).
+    """
+    import torch.multiprocessing as mp
+
+    if len(data) == 0:
+        raise ValueError("Dataset is empty")
+    idx = str(epoch)
+    print(f"Measuring checkpoint {idx} on {len(data)} images with {workers} worker processes, "
+          f"device={get_device()}, rex precision={precision}", flush=True)
+
+    start = time.time()
+    # "spawn" starts clean processes; CUDA does not survive "fork".
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(workers, initializer=_init_worker, initargs=(data,)) as pool:
+        parts = pool.map(_worker, [(epoch, r, workers, precision) for r in range(workers)])
+    rows = [r for part in parts for r in part]
+
+    print(f"checkpoint {idx}: {len(rows)} images explained in {(time.time() - start) / 60:.1f} min",
+          flush=True)
+    _write_results(idx, rows)
     return rows
