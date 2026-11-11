@@ -162,7 +162,7 @@ def pretrain(**kwargs):
 
     # Weights after every epoch go to pretrain_epoch_N.pth, so they never
     # collide with the fine-tuning checkpoints (epoch_N.pth).
-    model = _launch_train(base_train, base_test, phase="pretrain", **kwargs)
+    model = _launch_train(base_train, base_test, epochs=cfg.pretrain_epochs, phase="pretrain", **kwargs)
     _save(model.state_dict(), pretrained_model_location())
 
     return model

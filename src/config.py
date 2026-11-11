@@ -26,14 +26,19 @@ class Config:
     smoke_limit: int | None = 64 if SMOKE else None
 
     # training
-    epochs: int = 2 if SMOKE else 60
+    # Stav's current setup (upstream "Refinements", 2026-10-21): 12 epochs of
+    # CIFAR pretraining, then 60 epochs of junk fine-tuning.
+    pretrain_epochs: int = 2 if SMOKE else 12
+    epochs: int = 2 if SMOKE else 60  # junk fine-tuning epochs = measured checkpoints 1..N
     save_every: int = 1
     lr: float = 3e-4
     wd: float = 0.05
     label_smoothing: float = 0.1
 
     # model
-    model: str = "mixer_s32_224" if SMOKE else "mixer_b16_224"
+    # ViT-Base/16 trained from scratch, as upstream since "Usability fixes"
+    # (2026-11-05); earlier runs used the MLP-Mixer "mixer_b16_224".
+    model: str = "vit_tiny_patch16_224" if SMOKE else "vit_base_patch16_224"
     num_classes: int = 101
     ood_label: int = 100
 
