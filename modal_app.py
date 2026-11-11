@@ -8,9 +8,9 @@ One-time setup on your own machine:
     rclone copy r2:ooddata/ooddata/junk_cache ./junk_cache -P
     modal volume put ood-data ./junk_cache data/junk_cache
 
-Always use --detach: the entrypoint only starts the work and exits, and
-without --detach Modal stops the app as soon as it does. Watch with
-`modal app logs <app-id>` (`modal app list` shows the id).
+Use --detach for long runs: Modal then keeps the run going if the terminal
+is closed. Watch it again with `modal app logs <app-id>` (`modal app list`
+shows the id). Stopping it on purpose: `modal app stop <app-id>`.
 
 Run (from the repo root, on this branch):
     # 2-minute smoke test first
@@ -141,28 +141,31 @@ def measure_one(job_id: str, epoch: int, args: str, smoke: bool):
         vol.commit()
 
 
-def _measure_all(job_id, epochs, args, smoke):
-    """Start one L4 container per checkpoint, all running at the same time."""
-    todo = [int(e) for e in epochs.split(",") if e.strip()]
-    print(f"Measuring checkpoints {todo} on {MEASURE_GPU}, one container each, args={args!r}")
-    # spawn, not remote: the calls keep running after this local process
-    # exits, so closing the terminal (or Ctrl+C) can't cancel them.
-    for e in todo:
-        call = measure_one.spawn(job_id, e, args, smoke)
-        print(f"checkpoint {e}: started ({call.object_id})")
-    print("Follow progress with: modal app logs <app-id>  (modal app list shows the id)")
+@app.function(image=image, timeout=24 * 60 * 60)
+def measure_all(job_id: str, epochs: list, args: str, smoke: bool):
+    """Runs on Modal (no GPU) and starts one measure_one container per
+    checkpoint, all at once. Doing the fan-out here rather than on your
+    laptop means a detached run only has this one call to keep alive."""
+    results = measure_one.starmap(
+        [(job_id, e, args, smoke) for e in epochs], return_exceptions=True
+    )
+    failed = [e for e, r in zip(epochs, results) if isinstance(r, Exception)]
+    for e in failed:
+        print(f"checkpoint {e}: FAILED")
+    if failed:
+        print(f"Rerun just these with --epochs {','.join(map(str, failed))}")
 
 
 @app.local_entrypoint()
 def main(job_id: str = "modal", task: str = "all", args: str = "", smoke: bool = False,
          epochs: str = "0,5,10,15,20,25,30,35,40,45,50,55,60"):
+    # .remote() waits here and streams the logs. With --detach, Modal keeps the
+    # last call alive if this terminal is closed, so make exactly one call.
     if task == "measure-all":
-        _measure_all(job_id, epochs, args, smoke)
+        todo = [int(e) for e in epochs.split(",") if e.strip()]
+        print(f"Measuring checkpoints {todo} on {MEASURE_GPU}, one container each, args={args!r}")
+        measure_all.remote(job_id, todo, args, smoke)
     else:
         print(f"Starting task={task} job_id={job_id} gpu={GPU} smoke={smoke} args={args!r}")
-        # spawn, not remote: with --detach the run carries on after this local
-        # process exits, so closing the terminal (or Ctrl+C) can't cancel it.
-        call = run.spawn(job_id, task, args, smoke)
-        print(f"Started {call.object_id}. Follow it with: modal app logs <app-id>"
-              "  (modal app list shows the id)")
-    print("When it's finished: modal volume get ood-data results ./results")
+        run.remote(job_id, task, args, smoke)
+    print("Done. Fetch results with: modal volume get ood-data results ./results")
