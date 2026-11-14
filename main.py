@@ -101,7 +101,8 @@ def parse_args(argv=None):
     train_opts.add_argument("--precision", choices=("auto", "bf16", "fp16", "fp32"), default="auto",
                             help="Autocast dtype for training. auto = bf16 if the GPU supports it, else fp16")
     train_opts.add_argument("--compile", action="store_true",
-                            help="torch.compile the model (needs a Volta or newer GPU)")
+                            help="torch.compile the model (needs Triton: Linux, or Windows with "
+                                 "triton-windows installed; otherwise runs eagerly)")
     train_opts.add_argument("--resume", action="store_true",
                             help="Carry on from the last finished epoch after a crash or Ctrl+C")
     train_opts.add_argument("--save-every", type=int, default=None,

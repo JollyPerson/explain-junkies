@@ -20,7 +20,9 @@ class Config:
     # `python main.py prepare`. When present, ImageNet itself is not needed.
     junk_cache: str = "./data/junk_cache"
     num_workers: int = 0 if SMOKE else 8
-    batch_size: int = 8 if SMOKE else 64
+    # 128 for the 16 GB RTX 5080 (also used on the 24 GB L4). ViT-B/16 in bf16 with
+    # fused attention should fit; drop to 96 or 64 if the first step runs out of memory.
+    batch_size: int = 8 if SMOKE else 128
     eval_batch_size: int = 16 if SMOKE else 256
     # Caps CIFAR train/test sizes in smoke mode only.
     smoke_limit: int | None = 64 if SMOKE else None
@@ -31,7 +33,9 @@ class Config:
     pretrain_epochs: int = 2 if SMOKE else 12
     epochs: int = 2 if SMOKE else 60  # junk fine-tuning epochs = measured checkpoints 1..N
     save_every: int = 1
-    lr: float = 3e-4
+    # 3e-4 was tuned for batch 64; scaled by sqrt(128/64) for batch 128
+    # (square-root scaling, the usual rule for Adam when no warmup is added).
+    lr: float = 3e-4 * (128 / 64) ** 0.5  # ~4.24e-4
     wd: float = 0.05
     label_smoothing: float = 0.1
 

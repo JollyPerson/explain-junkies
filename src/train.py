@@ -14,6 +14,7 @@ from src.utils.naming import (
 from src.utils.load import create_model, load_model
 from src.utils.device import (
     get_device, seed_everything, seed_worker, loader_generator, amp_dtype, autocast,
+    can_compile, fast_fp32_matmul,
 )
 
 from src.config import Config
@@ -26,21 +27,24 @@ def evaluate(model, test_loader, criterion=None, device=None, dtype=None):
     # printed train and validation losses are comparable.
     criterion = criterion or nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
     model.eval()
-    correct, total, loss_sum = 0, 0, 0.0
+    # Accumulate on the device: one host sync at the end instead of two
+    # .item() calls per batch, so the GPU never waits on the Python loop.
+    loss_sum = torch.zeros((), device=device)
+    correct = torch.zeros((), device=device, dtype=torch.long)
+    total = 0
     with torch.inference_mode(), autocast(device, dtype):
         for x, y in test_loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             logits = model(x)
-            loss = criterion(logits.float(), y)
-            loss_sum += loss.item() * y.size(0)
-            correct += (logits.argmax(dim=1) == y).sum().item()
+            loss_sum += criterion(logits.float(), y) * y.size(0)
+            correct += (logits.argmax(dim=1) == y).sum()
             total += y.size(0)
-    return loss_sum / total, correct / total
+    return loss_sum.item() / total, correct.item() / total
 
 
-def _loader(ds, batch_size, shuffle, device):
+def _loader(ds, batch_size, shuffle, device, drop_last=False):
     return DataLoader(
-        ds, batch_size=batch_size, shuffle=shuffle,
+        ds, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
         num_workers=cfg.num_workers,
         pin_memory=(device == "cuda"),
         persistent_workers=cfg.num_workers > 0,
@@ -65,7 +69,10 @@ def _train(model, train_ds, test_ds, epochs=cfg.epochs, save_every=1,
     dtype = amp_dtype(device, precision)
     print(f"device={device} autocast={dtype}")
 
-    train_loader = _loader(train_ds, cfg.batch_size, True, device)
+    compile_model = compile_model and can_compile(device)
+    # A compiled model recompiles for the smaller final batch; dropping it keeps
+    # shapes static. Eager runs keep every sample, as before.
+    train_loader = _loader(train_ds, cfg.batch_size, True, device, drop_last=compile_model)
     # No gradients at evaluation time, so a much bigger batch fits.
     test_loader = _loader(test_ds, cfg.eval_batch_size, False, device)
 
@@ -79,8 +86,8 @@ def _train(model, train_ds, test_ds, epochs=cfg.epochs, save_every=1,
     # Loss scaling is only needed for fp16; bf16 has fp32's range.
     scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
 
-    # torch.compile needs a GPU of compute capability 7.0+ (Volta or newer),
-    # so it is opt-in: it does not work on Pascal cards such as the 1080 Ti.
+    # torch.compile is opt-in (--compile). It needs Triton, which Linux torch
+    # wheels include but Windows ones don't; can_compile() falls back to eager.
     step_model = torch.compile(model) if compile_model else model
 
     start_epoch = 1
@@ -153,7 +160,8 @@ def _launch_train(train, test, model=None, epochs=cfg.epochs, save_every=cfg.sav
         model = create_model()
         model.to(get_device())
 
-    _train(model, train, test, epochs, save_every=save_every, **kwargs)
+    with fast_fp32_matmul(get_device()):
+        _train(model, train, test, epochs, save_every=save_every, **kwargs)
     return model
 
 

@@ -1,6 +1,7 @@
 import os
 import random
 import contextlib
+import importlib.util
 
 import numpy as np
 import torch
@@ -57,3 +58,37 @@ def autocast(device, dtype):
     if dtype is None:
         return contextlib.nullcontext()
     return torch.autocast(device_type=device, dtype=dtype)
+
+
+def can_compile(device):
+    """torch.compile on CUDA needs Triton (bundled with Linux torch, not Windows)."""
+    if device != "cuda":
+        return False
+    if importlib.util.find_spec("triton") is None:
+        print("--compile ignored: Triton is not installed (Windows torch doesn't ship it); running eagerly")
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def fast_fp32_matmul(device):
+    """TF32 for matmuls/convs that stay in fp32 (all of them with --precision fp32)
+    on Ampere and newer, plus cuDNN autotuning. Scoped to training and restored
+    afterwards, so `all` doesn't carry it into measure, whose fp32 default is
+    meant to match the original numbers.
+    """
+    if device != "cuda":
+        yield
+        return
+    saved = (torch.backends.cuda.matmul.allow_tf32,
+             torch.backends.cudnn.allow_tf32,
+             torch.backends.cudnn.benchmark)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    try:
+        yield
+    finally:
+        (torch.backends.cuda.matmul.allow_tf32,
+         torch.backends.cudnn.allow_tf32,
+         torch.backends.cudnn.benchmark) = saved
