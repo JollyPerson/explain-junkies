@@ -32,6 +32,10 @@ Get the results back:
     modal volume ls ood-data results
     modal volume get ood-data results ./results
 
+Every run also writes a log next to its results (timings, it/s, GPU/CPU/RAM,
+accuracies), one folder per call, so it comes back with the command above:
+    results/<model>/<job_id>/logs/<UTC start>_<task>[_epN]/
+
 CIFAR-100 downloads itself onto the volume the first time. With the junk
 cache in data/junk_cache, ImageNet itself is never needed.
 """
@@ -68,6 +72,9 @@ image = (
         "matplotlib",
         "pillow",
         "tqdm",
+        # run log: CPU/RAM (psutil) and GPU utilisation/memory (NVML)
+        "psutil",
+        "nvidia-ml-py",
     )
     # Copy the code in; data, checkpoints and results live on the volume.
     .add_local_dir(

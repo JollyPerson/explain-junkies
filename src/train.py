@@ -1,4 +1,5 @@
 import os
+import time
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,7 @@ from src.utils.naming import (
     model_location, pretrained_model_location, pretrain_epoch_location, resume_location,
 )
 from src.utils.load import create_model, load_model
+from src.utils import runlog
 from src.utils.device import (
     get_device, seed_everything, seed_worker, loader_generator, amp_dtype, autocast,
     can_compile, fast_fp32_matmul,
@@ -106,13 +108,25 @@ def _train(model, train_ds, test_ds, epochs=cfg.epochs, save_every=1,
     elif resume:
         print(f"No {state_path} found; starting {phase} from epoch 1")
 
+    log = runlog.get()
+    last = {}
     for epoch in range(start_epoch, epochs + 1):
         step_model.train()
         pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs}", dynamic_ncols=True)
         running_loss = torch.zeros((), device=device)
+        running_correct = torch.zeros((), device=device, dtype=torch.long)
         n = 0
+        lr = optimizer.param_groups[0]["lr"]  # the lr this epoch trains with
+        if device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        epoch_start = time.time()
+        # Time the loop spends waiting for the DataLoader to hand over the
+        # next batch. Large = data loading (CPU) is the bottleneck, not the GPU.
+        data_wait = 0.0
+        t_fetch = time.perf_counter()
 
         for step, (x, y) in enumerate(pbar):
+            data_wait += time.perf_counter() - t_fetch
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
@@ -128,13 +142,39 @@ def _train(model, train_ds, test_ds, epochs=cfg.epochs, save_every=1,
             # Accumulate on the GPU and only sync for the progress bar every
             # 50 steps; calling loss.item() every step stalls the GPU.
             running_loss += loss.detach() * y.size(0)
+            # Accuracy on the (augmented) training batches, as the model was
+            # during the epoch; also accumulated on the GPU.
+            running_correct += (logits.detach().argmax(dim=1) == y).sum()
             n += y.size(0)
             if step % 50 == 0:
                 pbar.set_postfix(loss=running_loss.item() / n, lr=optimizer.param_groups[0]["lr"])
+            t_fetch = time.perf_counter()
 
+        batches = step + 1
+        train_loss, train_acc = running_loss.item() / n, running_correct.item() / n  # .item() syncs
+        train_end = time.time()
         scheduler.step()
         val_loss, val_acc = evaluate(step_model, test_loader, criterion, device, dtype)
-        print(f"  train_loss={running_loss.item() / n:.4f}  val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%")
+        eval_end = time.time()
+        print(f"  train_loss={train_loss:.4f}  train_acc={train_acc*100:.2f}%  "
+              f"val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%")
+
+        train_s = train_end - epoch_start
+        last = dict(
+            phase=phase, epoch=epoch, epochs=epochs,
+            start=runlog._now_iso(epoch_start), end=runlog._now_iso(eval_end),
+            duration_s=round(eval_end - epoch_start, 2),
+            train_s=round(train_s, 2), eval_s=round(eval_end - train_end, 2),
+            batches=batches, samples=n, batch_size=cfg.batch_size,
+            it_per_s=round(batches / train_s, 3), samples_per_s=round(n / train_s, 1),
+            data_wait_s=round(data_wait, 2), data_wait_pct=round(100 * data_wait / train_s, 1),
+            lr=lr, train_loss=round(train_loss, 5), train_acc=round(train_acc, 5),
+            val_loss=round(val_loss, 5), val_acc=round(val_acc, 5),
+            torch_peak_alloc_mb=(round(torch.cuda.max_memory_allocated() / 2**20)
+                                 if device == "cuda" else None),
+        )
+        log.epoch(**last)
+        log.count(batches)
 
         # The last epoch is always kept, so measure can rely on it existing.
         if save_every is not None and (epoch % save_every == 0 or epoch == epochs):
@@ -152,6 +192,10 @@ def _train(model, train_ds, test_ds, epochs=cfg.epochs, save_every=1,
             "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }, state_path)
 
+    if last:
+        log.set(final_epoch=last["epoch"], final_train_acc=last["train_acc"],
+                final_val_acc=last["val_acc"], final_val_loss=last["val_loss"])
+
 
 def _launch_train(train, test, model=None, epochs=cfg.epochs, save_every=cfg.save_every, **kwargs):
     if model is None:
@@ -166,7 +210,8 @@ def _launch_train(train, test, model=None, epochs=cfg.epochs, save_every=cfg.sav
 
 
 def pretrain(**kwargs):
-    base_train, base_test = get_base()
+    with runlog.get().stage("pretrain_load_data"):
+        base_train, base_test = get_base()
 
     # Weights after every epoch go to pretrain_epoch_N.pth, so they never
     # collide with the fine-tuning checkpoints (epoch_N.pth).
@@ -177,10 +222,11 @@ def pretrain(**kwargs):
 
 
 def train(use_parquet=False, imagenet_root=None, **kwargs):
-    mix_train, mix_test = get_mixed_dataset(
-        use_parquet=use_parquet,
-        imagenet_root=imagenet_root,
-    )
+    with runlog.get().stage("train_load_data"):
+        mix_train, mix_test = get_mixed_dataset(
+            use_parquet=use_parquet,
+            imagenet_root=imagenet_root,
+        )
 
     model = _launch_train(mix_train, mix_test, model=load_model(), phase="train", **kwargs)
     return model

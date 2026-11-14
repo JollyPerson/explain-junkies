@@ -133,6 +133,7 @@ def _make_rex(model, device, dtype):
 
 def _explain_one(rex, x, y, idx, image):
     """Run ReX on one image ([1, 3, 224, 224] on the device) and return its row."""
+    t0 = time.perf_counter()
     d = Data(
         input=tensor_to_pil(x.squeeze(0)),
         model_shape=["N", 3, 224, 224],
@@ -169,6 +170,35 @@ def _explain_one(rex, x, y, idx, image):
         "correct": int(pred_class == true_class),
         "confidence": float(rex.data.target.confidence),
         "size": size,
+        # Wall-clock ReX time for this image. Bigger explanations take longer
+        # (extraction adds pixels until the class comes back).
+        "seconds": round(time.perf_counter() - t0, 3),
+    }
+
+
+def checkpoint_summary(rows):
+    """Headline numbers for one measured checkpoint, for the run log.
+
+    accuracy: fraction of images whose predicted class is the true class.
+    mean_size: mean explanation size = fraction of the image's pixels in
+    ReX's sufficient explanation (0-1), over images that got one.
+    "real" = the 100 CIFAR classes, "junk" = images labelled cfg.ood_label.
+    """
+    def part(rs, tag):
+        sizes = _sizes(rs)
+        return {
+            f"n_{tag}": len(rs),
+            f"accuracy_{tag}": round(sum(r["correct"] for r in rs) / len(rs), 5) if rs else None,
+            f"mean_size_{tag}": round(statistics.fmean(sizes), 5) if sizes else None,
+            f"no_explanation_{tag}": len(rs) - len(sizes),
+        }
+    real = [r for r in rows if r["true_class"] != cfg.ood_label]
+    junk = [r for r in rows if r["true_class"] == cfg.ood_label]
+    secs = [r["seconds"] for r in rows if "seconds" in r]
+    return {
+        **part(rows, "all"), **part(real, "real"), **part(junk, "junk"),
+        "mean_confidence": round(statistics.fmean(r["confidence"] for r in rows), 5) if rows else None,
+        "rex_s_per_image_mean": round(statistics.fmean(secs), 3) if secs else None,
     }
 
 
