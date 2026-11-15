@@ -98,7 +98,8 @@ def main(args):
                 pretrain(**train_kwargs)
             case "train":
                 from src.train import train
-                train(use_parquet=args.parquet, imagenet_root=args.imagenet_root, **train_kwargs)
+                train(use_parquet=args.parquet, imagenet_root=args.imagenet_root,
+                      no_junk=args.no_junk, **train_kwargs)
             case "measure":
                 run_measure(args)
 
@@ -129,6 +130,9 @@ def parse_args(argv=None):
                             help="Keep weights only every N epochs, plus the last one "
                                  f"(default cfg.save_every = {cfg.save_every}). "
                                  "Applies to pretrain and train; measure follows it")
+    train_opts.add_argument("--no-junk", action="store_true",
+                            help="Control run: fine-tune on CIFAR-100 only, no junk images. "
+                                 "Measure is unchanged (same mixed test images as a junk run)")
 
     m = parser.add_argument_group("measure")
     m.add_argument("--epoch", type=int, nargs="+",

@@ -1,7 +1,9 @@
 import timm
 import torch
 
-from src.utils.naming import pretrained_model_location, model_location
+import os
+
+from src.utils.naming import pretrained_model_location, model_location, legacy_model_location
 from src.utils.device import get_device
 from src.config import Config
 cfg = Config()
@@ -15,7 +17,15 @@ def create_model(model=cfg.model):
 
 
 def checkpoint_location(epoch):
-    return pretrained_model_location() if epoch == 0 else model_location(epoch)
+    if epoch == 0:
+        return pretrained_model_location()
+    path = model_location(epoch)
+    legacy = legacy_model_location(epoch)
+    # Runs saved before per-job folders keep working: JOB_ID=vit1 finds
+    # models/<model>/epoch_N.pth when models/<model>/vit1/ doesn't have it.
+    if not os.path.exists(path) and os.path.exists(legacy):
+        return legacy
+    return path
 
 
 def load_weights(model, epoch):

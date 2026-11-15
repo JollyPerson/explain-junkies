@@ -221,12 +221,20 @@ def pretrain(**kwargs):
     return model
 
 
-def train(use_parquet=False, imagenet_root=None, **kwargs):
+def train(use_parquet=False, imagenet_root=None, no_junk=False, **kwargs):
     with runlog.get().stage("train_load_data"):
-        mix_train, mix_test = get_mixed_dataset(
-            use_parquet=use_parquet,
-            imagenet_root=imagenet_root,
-        )
+        if no_junk:
+            # Control run: the same fine-tuning from the same pretrained.pth,
+            # on the same 50,000 CIFAR images, but with no junk images. The
+            # head keeps its 101 outputs; class 100 is simply never a target.
+            # Validation is on the CIFAR test set (no junk to get right).
+            print("--no-junk: fine-tuning on CIFAR-100 only (control run)")
+            mix_train, mix_test = get_base()
+        else:
+            mix_train, mix_test = get_mixed_dataset(
+                use_parquet=use_parquet,
+                imagenet_root=imagenet_root,
+            )
 
     model = _launch_train(mix_train, mix_test, model=load_model(), phase="train", **kwargs)
     return model
