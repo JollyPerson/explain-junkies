@@ -1,121 +1,240 @@
+import os
+import time
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-import timm
 from tqdm import tqdm
 
 from src.data import get_base, get_mixed_dataset
-from src.utils.naming import model_location, pretrained_model_location
-from src.utils.load import load_model
+from src.utils.naming import (
+    model_location, pretrained_model_location, pretrain_epoch_location, resume_location,
+)
+from src.utils.load import create_model, load_model
+from src.utils import runlog
+from src.utils.device import (
+    get_device, seed_everything, seed_worker, loader_generator, amp_dtype, autocast,
+    can_compile, fast_fp32_matmul,
+)
 
 from src.config import Config
 cfg = Config()
 
 
-def evaluate(model, test_loader, criterion=nn.CrossEntropyLoss(label_smoothing=0.01), device='cuda'):
+def evaluate(model, test_loader, criterion=None, device=None, dtype=None):
+    device = device or get_device()
+    # Same loss as training (it used label_smoothing=0.01 here before), so the
+    # printed train and validation losses are comparable.
+    criterion = criterion or nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
     model.eval()
-    correct, total, loss_sum = 0, 0, 0.0
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device == "cuda")):
+    # Accumulate on the device: one host sync at the end instead of two
+    # .item() calls per batch, so the GPU never waits on the Python loop.
+    loss_sum = torch.zeros((), device=device)
+    correct = torch.zeros((), device=device, dtype=torch.long)
+    total = 0
+    with torch.inference_mode(), autocast(device, dtype):
         for x, y in test_loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             logits = model(x)
-            loss = criterion(logits, y)
-            loss_sum += loss.item() * y.size(0)
-            pred = logits.argmax(dim=1)
-            correct += (pred == y).sum().item()
+            loss_sum += criterion(logits.float(), y) * y.size(0)
+            correct += (logits.argmax(dim=1) == y).sum()
             total += y.size(0)
-    return loss_sum / total, correct / total
+    return loss_sum.item() / total, correct.item() / total
 
 
+def _loader(ds, batch_size, shuffle, device, drop_last=False):
+    return DataLoader(
+        ds, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
+        num_workers=cfg.num_workers,
+        pin_memory=(device == "cuda"),
+        persistent_workers=cfg.num_workers > 0,
+        worker_init_fn=seed_worker,
+        generator=loader_generator(cfg.seed),
+    )
 
-def _train(model, train_df, test_df, epochs=cfg.epochs, save_every=1):
+
+def _save(obj, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".partial"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)  # never leaves a half-written checkpoint
+
+
+def _train(model, train_ds, test_ds, epochs=cfg.epochs, save_every=1,
+           precision="auto", compile_model=False, phase="train", resume=False):
     print("Launching training")
+    seed_everything(cfg.seed)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.backends.cudnn.benchmark = True
+    device = get_device()
+    dtype = amp_dtype(device, precision)
+    print(f"device={device} autocast={dtype}")
 
-    train_loader = DataLoader(
-        train_df, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, pin_memory=True, persistent_workers=cfg.num_workers > 0
-    )
-    test_loader = DataLoader(
-        test_df, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=True, persistent_workers=cfg.num_workers > 0
-    )
+    compile_model = compile_model and can_compile(device)
+    # A compiled model recompiles for the smaller final batch; dropping it keeps
+    # shapes static. Eager runs keep every sample, as before.
+    train_loader = _loader(train_ds, cfg.batch_size, True, device, drop_last=compile_model)
+    # No gradients at evaluation time, so a much bigger batch fits.
+    test_loader = _loader(test_ds, cfg.eval_batch_size, False, device)
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
 
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
+    # The fused kernel does the whole AdamW update in one CUDA launch.
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.wd,
+                            fused=(device == "cuda"))
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+    # Loss scaling is only needed for fp16; bf16 has fp32's range.
+    scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16))
 
+    # torch.compile is opt-in (--compile). It needs Triton, which Linux torch
+    # wheels include but Windows ones don't; can_compile() falls back to eager.
+    step_model = torch.compile(model) if compile_model else model
 
-    for epoch in range(1, epochs + 1):
-        model.train()
+    start_epoch = 1
+    state_path = resume_location(phase)
+    if resume and os.path.exists(state_path):
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        scaler.load_state_dict(state["scaler"])
+        torch.set_rng_state(state["rng_cpu"])
+        if state.get("rng_cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["rng_cuda"])
+        start_epoch = state["epoch"] + 1
+        print(f"Resuming {phase} from epoch {state['epoch']} ({state_path})")
+    elif resume:
+        print(f"No {state_path} found; starting {phase} from epoch 1")
+
+    log = runlog.get()
+    last = {}
+    for epoch in range(start_epoch, epochs + 1):
+        step_model.train()
         pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs}", dynamic_ncols=True)
-        running_loss = 0.0
+        running_loss = torch.zeros((), device=device)
+        running_correct = torch.zeros((), device=device, dtype=torch.long)
         n = 0
+        lr = optimizer.param_groups[0]["lr"]  # the lr this epoch trains with
+        if device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        epoch_start = time.time()
+        # Time the loop spends waiting for the DataLoader to hand over the
+        # next batch. Large = data loading (CPU) is the bottleneck, not the GPU.
+        data_wait = 0.0
+        t_fetch = time.perf_counter()
 
-        for x, y in pbar:
+        for step, (x, y) in enumerate(pbar):
+            data_wait += time.perf_counter() - t_fetch
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast(enabled=(device == "cuda")):
-                logits = model(x)
-                loss = criterion(logits, y)
+            with autocast(device, dtype):
+                logits = step_model(x)
+                loss = criterion(logits.float(), y)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            running_loss += loss.item() * y.size(0)
+            # Accumulate on the GPU and only sync for the progress bar every
+            # 50 steps; calling loss.item() every step stalls the GPU.
+            running_loss += loss.detach() * y.size(0)
+            # Accuracy on the (augmented) training batches, as the model was
+            # during the epoch; also accumulated on the GPU.
+            running_correct += (logits.detach().argmax(dim=1) == y).sum()
             n += y.size(0)
-            pbar.set_postfix(loss=running_loss / n, lr=optimizer.param_groups[0]["lr"])
+            if step % 50 == 0:
+                pbar.set_postfix(loss=running_loss.item() / n, lr=optimizer.param_groups[0]["lr"])
+            t_fetch = time.perf_counter()
 
-            # skip for tests
-            # break
-
+        batches = step + 1
+        train_loss, train_acc = running_loss.item() / n, running_correct.item() / n  # .item() syncs
+        train_end = time.time()
         scheduler.step()
-        val_loss, val_acc = evaluate(model, test_loader, device=device)
-        print(f"  val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%")
+        val_loss, val_acc = evaluate(step_model, test_loader, criterion, device, dtype)
+        eval_end = time.time()
+        print(f"  train_loss={train_loss:.4f}  train_acc={train_acc*100:.2f}%  "
+              f"val_loss={val_loss:.4f}  val_acc={val_acc*100:.2f}%")
 
-        if save_every is not None and epoch % save_every == 0:
-            torch.save(model.state_dict(), model_location(epoch))
+        train_s = train_end - epoch_start
+        last = dict(
+            phase=phase, epoch=epoch, epochs=epochs,
+            start=runlog._now_iso(epoch_start), end=runlog._now_iso(eval_end),
+            duration_s=round(eval_end - epoch_start, 2),
+            train_s=round(train_s, 2), eval_s=round(eval_end - train_end, 2),
+            batches=batches, samples=n, batch_size=cfg.batch_size,
+            it_per_s=round(batches / train_s, 3), samples_per_s=round(n / train_s, 1),
+            data_wait_s=round(data_wait, 2), data_wait_pct=round(100 * data_wait / train_s, 1),
+            lr=lr, train_loss=round(train_loss, 5), train_acc=round(train_acc, 5),
+            val_loss=round(val_loss, 5), val_acc=round(val_acc, 5),
+            torch_peak_alloc_mb=(round(torch.cuda.max_memory_allocated() / 2**20)
+                                 if device == "cuda" else None),
+        )
+        log.epoch(**last)
+        log.count(batches)
+
+        # The last epoch is always kept, so measure can rely on it existing.
+        if save_every is not None and (epoch % save_every == 0 or epoch == epochs):
+            path = model_location(epoch) if phase == "train" else pretrain_epoch_location(epoch)
+            _save(model.state_dict(), path)
+
+        # Overwritten every epoch: everything needed to carry on after a crash.
+        _save({
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "rng_cpu": torch.get_rng_state(),
+            "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }, state_path)
+
+    if last:
+        log.set(final_epoch=last["epoch"], final_train_acc=last["train_acc"],
+                final_val_acc=last["val_acc"], final_val_loss=last["val_loss"])
 
 
-def _launch_train(train, test, model=None, epochs=cfg.epochs, save_every=cfg.save_every):
-    print("Begin mixed training task")
-    device = "cuda" if torch.cuda.is_available() else 'cpu'
-
+def _launch_train(train, test, model=None, epochs=cfg.epochs, save_every=cfg.save_every, **kwargs):
     if model is None:
         print(f"Loading {cfg.model} architecture")
-        model = timm.create_model(cfg.model, pretrained=False, num_classes=cfg.num_classes)
-        
-        print(f"Sending model to {device}")
-        model.to(device)
-    
-    _train(model, train, test, cfg.epochs, save_every=save_every)
+        seed_everything(cfg.seed)  # same initial weights every run
+        model = create_model()
+        model.to(get_device())
+
+    with fast_fp32_matmul(get_device()):
+        _train(model, train, test, epochs, save_every=save_every, **kwargs)
     return model
 
 
-def pretrain():
-    base_train, base_test = get_base()
-    
-    model = _launch_train(base_train, base_test, save_every=None)
-    torch.save(model.state_dict(), pretrained_model_location())
+def pretrain(**kwargs):
+    with runlog.get().stage("pretrain_load_data"):
+        base_train, base_test = get_base()
+
+    # Weights after every epoch go to pretrain_epoch_N.pth, so they never
+    # collide with the fine-tuning checkpoints (epoch_N.pth).
+    model = _launch_train(base_train, base_test, epochs=cfg.pretrain_epochs, phase="pretrain", **kwargs)
+    _save(model.state_dict(), pretrained_model_location())
 
     return model
 
 
-def train(use_parquet=False, imagenet_root=None):
-    mix_train, mix_test = get_mixed_dataset(
-        use_parquet=use_parquet,
-        imagenet_root=imagenet_root,
-    )
+def train(use_parquet=False, imagenet_root=None, no_junk=False, **kwargs):
+    with runlog.get().stage("train_load_data"):
+        if no_junk:
+            # Control run: the same fine-tuning from the same pretrained.pth,
+            # on the same 50,000 CIFAR images, but with no junk images. The
+            # head keeps its 101 outputs; class 100 is simply never a target.
+            # Validation is on the CIFAR test set (no junk to get right).
+            print("--no-junk: fine-tuning on CIFAR-100 only (control run)")
+            mix_train, mix_test = get_base()
+        else:
+            mix_train, mix_test = get_mixed_dataset(
+                use_parquet=use_parquet,
+                imagenet_root=imagenet_root,
+            )
 
-    model = _launch_train(mix_train, mix_test, model=load_model())
+    model = _launch_train(mix_train, mix_test, model=load_model(), phase="train", **kwargs)
     return model

@@ -3,10 +3,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import timm
-
 from pathlib import Path
-from main import *
 
 CIFAR100_LABELS = {
     0: "apple", 1: "aquarium_fish", 2: "baby", 3: "bear", 4: "beaver",
@@ -55,23 +52,52 @@ def add_class_labels(df):
 
 
 
-def collate_results(results_dir):
+def _collate(results_dir, pattern):
     frames = []
 
-    for csv_path in Path(results_dir).rglob("per_class.csv"):
+    for csv_path in sorted(Path(results_dir).rglob(pattern)):
         df = pd.read_csv(csv_path)
-
         df["job_id"] = csv_path.parent.name
         df["model"] = csv_path.parent.parent.name
-
+        df["source_file"] = csv_path.name
         frames.append(df)
 
-    if not frames:
-        raise RuntimeError(
-            f"No per_class.csv files found in {results_dir}"
-        )
+    return pd.concat(frames, ignore_index=True) if frames else None
 
-    return pd.concat(frames, ignore_index=True)
+
+def collate_results(results_dir):
+    """Returns (overall, per_class).
+
+    per_class: every per_class*.csv (per_class_epoch_NNN.csv from measure, or
+    the older single per_class.csv). overall: one row per job and checkpoint.
+    Its stdev is over images when per_image files exist, otherwise over the
+    class means.
+    """
+    per_class = _collate(results_dir, "per_class*.csv")
+    if per_class is None:
+        raise RuntimeError(f"No per_class*.csv files found in {results_dir}")
+
+    per_image = _collate(results_dir, "per_image*.csv")
+    keys = ["model", "job_id", "idx"]
+
+    if per_image is not None:
+        overall = (
+            per_image.groupby(keys, as_index=False)
+            .agg(mean=("size", "mean"), stdev=("size", "std"),
+                 accuracy=("correct", "mean"), total=("size", "size"))
+        )
+    else:
+        pc = clean_frame(per_class)
+        pc["weighted"] = pc["mean"] * pc["total"]
+        overall = pc.groupby(keys, as_index=False).agg(
+            weighted=("weighted", "sum"), correct=("correct", "sum"),
+            total=("total", "sum"), stdev=("mean", "std"),
+        )
+        overall["mean"] = overall["weighted"] / overall["total"]
+        overall["accuracy"] = overall["correct"] / overall["total"]
+
+    overall["class"] = "overall"
+    return overall, per_class
 
 
 def save_scatter_fit(df, x, y, out_path, title):
@@ -254,7 +280,7 @@ def save_per_class_bar_by_selected_idx(df, out_path, selected_idxs=None):
             continue
 
         grouped = grouped.sort_values("exp_mean", ascending=False)
-        bar_color = "green" if int(idx_value) == 59 else None
+        bar_color = "green" if int(idx_value) == int(max(available_idxs)) else None
 
         exp_ax.bar(grouped["class_label"], grouped["exp_mean"], color=bar_color)
         exp_ax.set_title(f"Explanation size per class — idx {idx_value}")
@@ -285,7 +311,7 @@ def visualize(results_dir, out_dir):
     if "class" in overall.columns:
         overall = overall[overall["class"].astype(str) == "overall"].copy()
 
-    overall = overall.sort_values(["idx", "job_id", "source_file"])
+    overall = overall.sort_values(["idx", "job_id"])
 
     save_scatter_fit(
         overall,
@@ -324,7 +350,10 @@ def visualize(results_dir, out_dir):
     save_per_class_bar_by_selected_idx(
         per_class,
         out_path=os.path.join(out_dir, "per_class_explanation_size_idx1_last.png"),
-        selected_idxs=(1, int(pd.to_numeric(per_class["idx"], errors="coerce").max())),
+        selected_idxs=(
+            int(pd.to_numeric(per_class["idx"], errors="coerce").min()),
+            int(pd.to_numeric(per_class["idx"], errors="coerce").max()),
+        ),
     )
 
 
@@ -333,7 +362,5 @@ if __name__ == "__main__":
     parser.add_argument("--results-dir", default="results")
     parser.add_argument("--out-dir", default="visualizations")
     args = parser.parse_args()
-
-    model = timm.create_model(cfg.model, pretrained=False, num_classes=cfg.num_classes)
 
     visualize(args.results_dir, args.out_dir)
